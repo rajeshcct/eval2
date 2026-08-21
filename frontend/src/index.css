@@ -1,0 +1,33 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-slate-950 text-slate-100 antialiased;
+}
+
+/* Report -> PDF export. The report is exported via the browser's native
+ * print pipeline (window.print(), "Save as PDF"), so the printed page
+ * gets its own light, ink-friendly "document" theme instead of the app's
+ * dark UI theme. Per-element light/dark pairing lives in ReportView.tsx
+ * via Tailwind's print: variant; this block covers the few things that
+ * can't be scoped to one component. */
+@media print {
+  @page {
+    margin: 16mm 14mm;
+  }
+
+  html,
+  body {
+    background: #ffffff !important;
+  }
+
+  /* Chrome/most browsers drop background colors on print by default
+   * ("Background graphics" is opt-in in the print dialog). This forces
+   * status pills, badges, and the verdict stamp to keep their fill when
+   * that option is on, without affecting on-screen rendering at all. */
+  * {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+}

@@ -1,0 +1,12 @@
+# EvalMind — verified working dependency set (installed & smoke-tested)
+# crewai[tools,anthropic] pulls in native Anthropic support alongside the default
+# OpenAI/litellm path, so config/llm_config.py can switch providers via .env
+# without touching this file.
+crewai[tools,anthropic,google-genai]==1.15.16
+python-dotenv==1.2.3
+pydantic==2.12.5
+litellm
+
+# aut/connector.py's "custom_endpoint" mode calls this directly (it was
+# previously only a transitive dependency of crewai).
+requests==2.34.2

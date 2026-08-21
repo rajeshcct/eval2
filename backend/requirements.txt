@@ -1,0 +1,10 @@
+# EvalMind backend (Phase II) — installed on top of the project root's own
+# requirements.txt (crewai, pydantic, requests, etc. — the backend imports
+# those modules directly, see backend/README.md).
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# httpx is a transitive fastapi/starlette dependency already, but pinned
+# here explicitly since backend/tests/test_ws_flow.py imports
+# fastapi.testclient.TestClient directly, which requires it.
+httpx==0.28.1
