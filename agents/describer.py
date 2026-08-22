@@ -114,7 +114,7 @@ def build_describer_agent() -> Agent:
             "face value, and you always call out disagreements between claim "
             "and behavior explicitly rather than quietly picking one."
         ),
-        llm=get_llm(temperature=DESCRIBER_TEMPERATURE),
+        llm=get_llm(temperature=DESCRIBER_TEMPERATURE, role="describer"),
         verbose=True,
     )
 

@@ -112,7 +112,7 @@ def build_judge_agent() -> Agent:
             "demonstrated. You are highly consistent: given the same task and "
             "output twice, you give the same scores both times."
         ),
-        llm=get_llm(temperature=JUDGE_TEMPERATURE),
+        llm=get_llm(temperature=JUDGE_TEMPERATURE, role="judge"),
         verbose=True,
     )
 

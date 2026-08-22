@@ -40,83 +40,94 @@ def _get_provider() -> str:
     return provider
 
 
+# Roles that support a per-role model override. Each maps to an env var
+# named f"{PROVIDER}_MODEL_{ROLE}" (e.g. OPENAI_MODEL_JUDGE), checked before
+# falling back to the provider's plain f"{PROVIDER}_MODEL" default. This
+# lets Describer/Generator/Judge each run on a different model — e.g.
+# a cheap model for the Describer's light extraction, a stronger creative
+# model for the Generator's adversarial task-writing, a mid-tier model for
+# the Judge's rubric-following scoring — without touching any agent code
+# beyond the get_llm(role=...) call site.
+VALID_ROLES = ("describer", "generator", "judge")
+
+_PROVIDER_DEFAULT_MODELS = {
+    "openai": "gpt-4o-mini",
+    "anthropic": "claude-3-5-sonnet-20241022",
+    "groq": "openai/gpt-oss-120b",
+    "gemini": "gemini-3.5-flash",
+}
+
+# model string prefixes crewai/litellm needs to route to the right native
+# provider. openai has none — its models are unprefixed.
+_PROVIDER_MODEL_PREFIX = {
+    "openai": "",
+    "anthropic": "anthropic/",
+    "groq": "groq/",
+    "gemini": "gemini/",
+}
+
+
+def _resolve_model(provider: str, role: str | None) -> str:
+    """Role-specific env var (e.g. OPENAI_MODEL_JUDGE) wins if set and
+    non-empty; otherwise fall back to the provider's plain *_MODEL var;
+    otherwise fall back to the hardcoded default for that provider."""
+    provider_upper = provider.upper()
+    if role:
+        role_specific = os.getenv(f"{provider_upper}_MODEL_{role.upper()}", "").strip()
+        if role_specific:
+            return role_specific
+    return os.getenv(f"{provider_upper}_MODEL", _PROVIDER_DEFAULT_MODELS[provider]).strip()
+
+
 @lru_cache(maxsize=None)
-def get_llm(provider: str | None = None, temperature: float | None = None) -> LLM:
+def get_llm(provider: str | None = None, temperature: float | None = None, role: str | None = None) -> LLM:
     """
     Build (and cache) a crewai.LLM configured from .env.
 
     Args:
-        provider: optional override ("openai", "anthropic", or "groq"). If omitted,
-                  reads LLM_PROVIDER from .env (defaults to "openai").
+        provider: optional override ("openai", "anthropic", "groq", or
+                  "gemini"). If omitted, reads LLM_PROVIDER from .env
+                  (defaults to "openai").
         temperature: optional per-call override (e.g. a low, stable value for
                      an evaluator agent like the Judge). If omitted, the
-                     provider's own default temperature is used. Different
-                     (provider, temperature) pairs are cached separately, so
-                     e.g. the Judge and Describer can each get their own LLM
-                     instance without either one mutating a shared object.
+                     provider's own default temperature is used.
+        role: optional one of "describer" | "generator" | "judge". When set,
+              the model is looked up from f"{PROVIDER}_MODEL_{ROLE}" first
+              (e.g. OPENAI_MODEL_JUDGE), falling back to the provider's
+              plain *_MODEL var if that's unset — so a role only needs its
+              own .env line when you actually want it on a different model
+              than the rest. (provider, temperature, role) triples are
+              cached separately, so e.g. the Judge and Describer can each
+              get their own LLM instance without either one mutating a
+              shared object.
 
     Raises:
+        ValueError: if role is given but isn't one of VALID_ROLES.
         MissingAPIKeyError: if the relevant *_API_KEY is not set in .env.
                              This is the expected error today, since no real
                              key has been configured yet — set one in .env
                              when you're ready to actually run a Crew.
     """
     provider = (provider or _get_provider()).strip().lower()
+    if role is not None and role not in VALID_ROLES:
+        raise ValueError(f"role must be one of {VALID_ROLES} or None, got {role!r}")
 
-    if provider == "openai":
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-        if not api_key:
-            raise MissingAPIKeyError(
-                "LLM_PROVIDER is 'openai' but OPENAI_API_KEY is empty in .env. "
-                "Copy .env.example to .env and set a real key."
-            )
-        kwargs = {"model": model, "api_key": api_key}
-        if temperature is not None:
-            kwargs["temperature"] = temperature
-        return LLM(**kwargs)
+    if provider not in SUPPORTED_PROVIDERS:
+        raise ValueError(f"Unsupported provider: {provider}")
 
-    if provider == "anthropic":
-        api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-        model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022").strip()
-        if not api_key:
-            raise MissingAPIKeyError(
-                "LLM_PROVIDER is 'anthropic' but ANTHROPIC_API_KEY is empty in .env. "
-                "Copy .env.example to .env and set a real key."
-            )
-        # model string is prefixed so crewai routes to the native Anthropic provider
-        kwargs = {"model": f"anthropic/{model}", "api_key": api_key}
-        if temperature is not None:
-            kwargs["temperature"] = temperature
-        return LLM(**kwargs)
+    api_key = os.getenv(f"{provider.upper()}_API_KEY", "").strip()
+    if not api_key:
+        raise MissingAPIKeyError(
+            f"LLM_PROVIDER is '{provider}' but {provider.upper()}_API_KEY is empty in .env. "
+            "Copy .env.example to .env and set a real key."
+        )
 
-    if provider == "groq":
-        api_key = os.getenv("GROQ_API_KEY", "").strip()
-        model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
-        if not api_key:
-            raise MissingAPIKeyError(
-                "LLM_PROVIDER is 'groq' but GROQ_API_KEY is empty in .env. "
-                "Copy .env.example to .env and set a real key."
-            )
-        kwargs = {"model": f"groq/{model}", "api_key": api_key}
-        if temperature is not None:
-            kwargs["temperature"] = temperature
-        return LLM(**kwargs)
-
-    if provider == "gemini":
-        api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
-        if not api_key:
-            raise MissingAPIKeyError(
-                "LLM_PROVIDER is 'gemini' but GEMINI_API_KEY is empty in .env. "
-                "Copy .env.example to .env and set a real key."
-            )
-        kwargs = {"model": f"gemini/{model}", "api_key": api_key}
-        if temperature is not None:
-            kwargs["temperature"] = temperature
-        return LLM(**kwargs)
-
-    raise ValueError(f"Unsupported provider: {provider}")
+    model = _resolve_model(provider, role)
+    prefix = _PROVIDER_MODEL_PREFIX[provider]
+    kwargs = {"model": f"{prefix}{model}" if prefix else model, "api_key": api_key}
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    return LLM(**kwargs)
 
 
 def is_configured() -> bool:
