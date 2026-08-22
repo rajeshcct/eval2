@@ -63,6 +63,15 @@ export interface SocketIOConnectionRequest {
   // submitted object if non-empty".
   socketio_path?: string;
   chat_message_event?: string;
+  /** Max seconds of no chat:token/chat:data activity before the response
+   * is treated as finished. Leave unset to use the connector's fixed
+   * 150.0s default. Raise this for AUTs with slow-but-alive backend pauses
+   * (e.g. a cold container/DB connection on the first call of a session)
+   * that would otherwise get mistaken for "done" and truncated mid-
+   * response. Must stay below response_timeout_seconds above, or the hard
+   * timeout wins first — see aut/connector.py::_call_socketio_endpoint's
+   * _silence_watcher. */
+  token_silence_timeout_seconds?: number;
 }
 
 export function defaultSocketIOConnectionRequest(): SocketIOConnectionRequest {
@@ -71,7 +80,12 @@ export function defaultSocketIOConnectionRequest(): SocketIOConnectionRequest {
     chat_endpoint_url: "",
     bearer_token: "",
     origin_header: null,
-    response_timeout_seconds: 120.0,
+    // Must stay above token_silence_timeout_seconds below (whether left at
+    // the connector's fixed 150s default or overridden) or the hard
+    // timeout always wins first, even on a stream that's still alive but
+    // has gone quiet. See aut/connector.py::_call_socketio_endpoint's
+    // _silence_watcher.
+    response_timeout_seconds: 200.0,
   };
 }
 

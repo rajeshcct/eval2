@@ -253,12 +253,15 @@ def _build_breaking_point_summary(category: str, entry: RoundHistoryEntry) -> st
 def _build_category_report(category: str, rows: List[Dict[str, Any]]) -> CategoryReport:
     round_history = [_round_history_entry_from_row(r) for r in rows]
 
-    # The escalating loop (loop_runner.run_category_loop) stops at the FIRST
-    # failing round, so there should be at most one failure, and it should
-    # be the last round stored. This doesn't assume that shape blindly,
-    # though — it takes the first failing round found, in round_number
-    # order, so a report built from an unusual/hand-edited DB state still
-    # behaves sensibly rather than picking an arbitrary later failure.
+    # The escalating loop (loop_runner.run_category_loop) now runs every
+    # round through max_rounds regardless of failures, so a category can
+    # legitimately have MULTIPLE failing rounds, not just one. This always
+    # takes the FIRST failing round found, in round_number order — that's
+    # the category's breaking_point by definition (loop_runner.py records
+    # the same round as its own breaking_point, and never overwrites it on
+    # a later failure) — later failures still show up in round_history,
+    # they just aren't what breaking_point_round/breaking_point_summary
+    # describe.
     failing_entry = next((r for r in round_history if r.passed is False), None)
 
     if failing_entry is not None:

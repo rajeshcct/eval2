@@ -163,6 +163,176 @@ function RoundHistoryRow({ round, forcedOpen }: { round: RoundHistoryEntry; forc
   );
 }
 
+const CHART_WIDTH = 600;
+const CHART_HEIGHT = 140;
+const CHART_PAD_LEFT = 22;
+const CHART_PAD_RIGHT = 12;
+const CHART_PAD_TOP = 10;
+const CHART_PAD_BOTTOM = 20;
+
+type ChartKey = "task_completion" | "security" | "compliance";
+const CHART_SERIES: { key: ChartKey; color: string; label: string }[] = [
+  { key: "task_completion", color: "#818cf8", label: "task completion" },
+  { key: "security", color: "#fb7185", label: "security" },
+  { key: "compliance", color: "#34d399", label: "compliance" },
+];
+
+/** The report's core signal made visible at a glance: how task_completion /
+ * security / compliance moved round-over-round, with the breaking point (if
+ * any) marked. Previously this shape only existed implicitly, spread across
+ * collapsed accordion rows a reader had to open one by one. Hand-rolled SVG
+ * rather than a charting dependency — keeps it printing cleanly to PDF and
+ * avoids adding recharts/chart.js just for three lines. Skipped entirely
+ * below 2 scored rounds, since a single point can't show a trend. */
+function ScoreTrendChart({ report }: { report: CategoryReport }) {
+  const rounds = report.round_history.filter(
+    (r) => r.task_completion !== null || r.security !== null || r.compliance !== null,
+  );
+  if (rounds.length < 2) return null;
+
+  const innerWidth = CHART_WIDTH - CHART_PAD_LEFT - CHART_PAD_RIGHT;
+  const innerHeight = CHART_HEIGHT - CHART_PAD_TOP - CHART_PAD_BOTTOM;
+
+  const xFor = (i: number) =>
+    CHART_PAD_LEFT + (rounds.length === 1 ? innerWidth / 2 : (i / (rounds.length - 1)) * innerWidth);
+  const yFor = (score: number) => CHART_PAD_TOP + innerHeight - (score / 10) * innerHeight;
+
+  function pathFor(key: ChartKey): string {
+    const pts = rounds
+      .map((r, i) => (r[key] !== null ? `${xFor(i)},${yFor(r[key] as number)}` : null))
+      .filter((p): p is string => p !== null);
+    return pts.length > 0 ? `M ${pts.join(" L ")}` : "";
+  }
+
+  const breakIndex =
+    report.breaking_point_round !== null
+      ? rounds.findIndex((r) => r.round_number === report.breaking_point_round)
+      : -1;
+
+  return (
+    <div className="border-b border-slate-800 px-4 py-3 print:border-slate-200 print:break-inside-avoid">
+      <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
+        <span className="font-mono text-[10px] uppercase tracking-wide text-slate-500 print:text-slate-600">
+          Score by round
+        </span>
+        <div className="flex items-center gap-3 font-mono text-[10px]">
+          {CHART_SERIES.map((s) => (
+            <span key={s.key} className="flex items-center gap-1 text-slate-400 print:text-slate-600">
+              <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: s.color }} />
+              {s.label}
+            </span>
+          ))}
+        </div>
+      </div>
+      <svg viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`} className="h-28 w-full" preserveAspectRatio="none">
+        {[0, 5, 10].map((tick) => (
+          <g key={tick}>
+            <line
+              x1={CHART_PAD_LEFT}
+              x2={CHART_WIDTH - CHART_PAD_RIGHT}
+              y1={yFor(tick)}
+              y2={yFor(tick)}
+              stroke="currentColor"
+              className="text-slate-800 print:text-slate-200"
+              strokeWidth={1}
+              strokeDasharray={tick === 0 ? undefined : "3,3"}
+            />
+            <text
+              x={1}
+              y={yFor(tick) + 3}
+              fontSize={9}
+              fill="currentColor"
+              className="text-slate-600 print:text-slate-500"
+            >
+              {tick}
+            </text>
+          </g>
+        ))}
+
+        {breakIndex >= 0 && (
+          <line
+            x1={xFor(breakIndex)}
+            x2={xFor(breakIndex)}
+            y1={CHART_PAD_TOP}
+            y2={CHART_HEIGHT - CHART_PAD_BOTTOM}
+            stroke="#f87171"
+            strokeWidth={1.5}
+            strokeDasharray="4,3"
+          />
+        )}
+
+        {CHART_SERIES.map((s) => {
+          const d = pathFor(s.key);
+          return d ? <path key={s.key} d={d} fill="none" stroke={s.color} strokeWidth={1.75} /> : null;
+        })}
+
+        {CHART_SERIES.map((s) =>
+          rounds.map((r, i) =>
+            r[s.key] !== null ? (
+              <circle key={`${s.key}-${i}`} cx={xFor(i)} cy={yFor(r[s.key] as number)} r={2} fill={s.color} />
+            ) : null,
+          ),
+        )}
+
+        {rounds.map((r, i) => (
+          <text
+            key={`x-${i}`}
+            x={xFor(i)}
+            y={CHART_HEIGHT - 4}
+            fontSize={9}
+            textAnchor="middle"
+            fill="currentColor"
+            className="text-slate-600 print:text-slate-500"
+          >
+            R{r.round_number}
+          </text>
+        ))}
+      </svg>
+      {breakIndex >= 0 && (
+        <div className="mt-1 text-[10px] text-red-400 print:text-red-700">
+          Broke at round {report.breaking_point_round}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Compact per-category summary shown right under the masthead, before the
+ * prose verdict — lets a reader take in the shape of the whole result (which
+ * categories held up, which didn't, and where) in one glance rather than
+ * needing to scroll through three full sections first. */
+function CategoryGlanceStrip({ entries }: { entries: { key: string; report: CategoryReport }[] }) {
+  if (entries.length === 0) return null;
+  return (
+    <div className="flex flex-wrap gap-2 print:gap-1.5">
+      {entries.map(({ key, report }) => {
+        const counted = report.round_history.filter((r) => r.passed !== null);
+        const passed = counted.filter((r) => r.passed).length;
+        const broken = report.status === "broken";
+        return (
+          <div
+            key={key}
+            className={`flex min-w-[140px] flex-1 items-center justify-between gap-2 rounded-md border px-3 py-2 text-xs print:py-1.5 ${
+              broken
+                ? "border-red-900 bg-red-950/20 print:border-red-200 print:bg-red-50"
+                : "border-emerald-900 bg-emerald-950/20 print:border-emerald-200 print:bg-emerald-50"
+            }`}
+          >
+            <span className="font-medium text-slate-200 print:text-slate-800">{LABELS[key] ?? key}</span>
+            <span
+              className={`font-mono ${
+                broken ? "text-red-300 print:text-red-700" : "text-emerald-300 print:text-emerald-700"
+              }`}
+            >
+              {broken ? `broke @ R${report.breaking_point_round}` : `${passed}/${counted.length} passed`}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function CategorySection({
   category,
   report,
@@ -206,6 +376,8 @@ function CategorySection({
           Robust — survived every round up to the cap
         </div>
       )}
+
+      <ScoreTrendChart report={report} />
 
       <div>
         {report.round_history.length === 0 ? (
@@ -337,6 +509,10 @@ export default function ReportView({ report, onReset }: ReportViewProps) {
     (c): c is CategoryReport => Boolean(c),
   );
   const allRobust = presentCategories.length > 0 && presentCategories.every((c) => c.status !== "broken");
+  const glanceEntries = CATEGORY_ORDER.flatMap((c) => {
+    const cat = report.categories[c];
+    return cat ? [{ key: c, report: cat }] : [];
+  });
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 print:max-w-none print:gap-3">
@@ -381,6 +557,8 @@ export default function ReportView({ report, onReset }: ReportViewProps) {
           </div>
         )}
       </div>
+
+      <CategoryGlanceStrip entries={glanceEntries} />
 
       <section className="rounded-lg border border-slate-800 bg-slate-900/40 p-4 print:border-slate-300 print:bg-white">
         <h2 className="font-mono text-xs font-medium uppercase tracking-wide text-slate-500 print:text-slate-600">

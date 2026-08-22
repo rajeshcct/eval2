@@ -25,6 +25,21 @@ load_dotenv()  # reads .env in the project root (no-op if the file doesn't exist
 
 SUPPORTED_PROVIDERS = ("openai", "anthropic", "groq", "gemini")
 
+# OpenAI's GPT-5 reasoning-model line (gpt-5, gpt-5-mini, gpt-5.1, gpt-5.4-mini,
+# gpt-5.6-terra, etc.) rejects any EXPLICIT `temperature` value with a 400
+# ("Only the default (1) value is supported") unless the request also sets
+# reasoning_effort="none" -- which this project doesn't do, since Generator/
+# Judge/Describer all rely on their reasoning for task-writing and scoring
+# quality. Detected by prefix so new gpt-5.x releases are covered without
+# an .env-triggered outage the day they're set as a role's model.
+_REASONING_MODEL_PREFIXES = ("gpt-5",)
+
+
+def _rejects_explicit_temperature(provider: str, model: str) -> bool:
+    """True if (provider, model) is a reasoning-family model that 400s on
+    any explicit `temperature` override."""
+    return provider == "openai" and model.startswith(_REASONING_MODEL_PREFIXES)
+
 
 class MissingAPIKeyError(RuntimeError):
     """Raised when get_llm() is called but no key is configured for the selected provider."""
@@ -126,7 +141,16 @@ def get_llm(provider: str | None = None, temperature: float | None = None, role:
     prefix = _PROVIDER_MODEL_PREFIX[provider]
     kwargs = {"model": f"{prefix}{model}" if prefix else model, "api_key": api_key}
     if temperature is not None:
-        kwargs["temperature"] = temperature
+        if _rejects_explicit_temperature(provider, model):
+            # Silently drop the override rather than sending a value this
+            # model 400s on -- it runs at its own implicit default (1)
+            # instead. role-specific temperature tuning (JUDGE_TEMPERATURE,
+            # GENERATOR_TEMPERATURE, DESCRIBER_TEMPERATURE) simply has no
+            # effect for whichever role is pointed at a gpt-5.x model until
+            # that role is switched to a non-reasoning model.
+            pass
+        else:
+            kwargs["temperature"] = temperature
     return LLM(**kwargs)
 
 

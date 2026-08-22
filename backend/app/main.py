@@ -28,9 +28,15 @@ from aut.auth import (
     build_public_api_config,
     build_socketio_endpoint_config,
 )
+from aut.connector import call_aut
 from config.llm_config import is_configured
 from db.store import get_final_report, init_db
 from session import run_full_session
+
+# A throwaway prompt sent once, before the real session, whenever a
+# socketio_endpoint AUT is used — see _warm_up_socketio_aut()'s docstring
+# for why this exists.
+_WARMUP_TASK = "Hello"
 
 
 @asynccontextmanager
@@ -99,6 +105,31 @@ class SessionStartRequest(BaseModel):
 _DONE = object()  # internal sentinel; never actually sent over the wire
 
 
+def _warm_up_socketio_aut(aut_config: Any) -> None:
+    """Best-effort throwaway call before a socketio_endpoint session starts.
+
+    Some socketio_endpoint AUTs (observed with Navigatto) take a long,
+    genuinely-alive pause on the FIRST call of a session — a cold
+    container, a cold DB connection, an unwarmed cache — that can exceed
+    the connector's token-silence fallback (SocketIOEndpointConfig's
+    token_silence_timeout_seconds, fixed at 150.0s unless overridden) and
+    get the response truncated mid-stream, even though the AUT was never
+    actually broken. Sending one disposable "Hello" and discarding the
+    result before the real Describer/round calls begin means that cold
+    start is paid for here instead of during round 1 of the real
+    evaluation, where it would otherwise corrupt a real scored round.
+
+    Deliberately swallows every exception — a failed warm-up should never
+    block or fail the real run; if the AUT is genuinely unreachable, that
+    will surface again immediately, correctly, on the real first call
+    inside run_full_session().
+    """
+    try:
+        call_aut(_WARMUP_TASK, aut_config)
+    except Exception:  # noqa: BLE001 - best-effort only, never propagate
+        pass
+
+
 @app.websocket("/ws/run")
 async def ws_run(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -138,11 +169,15 @@ async def ws_run(websocket: WebSocket) -> None:
                 # during the actual Socket.IO connect attempt inside
                 # run_full_session(), as a `stage: "session"` error below —
                 # not `stage: "auth"`. That's intentional: it accurately
-                # reflects that no auth/login step ran for this mode, so
-                # don't special-case it into a fake auth-stage failure.
+                # reflects that no auth step ran for this mode, so don't
+                # special-case it into a fake auth-stage failure.
                 aut_config = await asyncio.to_thread(
                     build_socketio_endpoint_config, start_request.connection
                 )
+                # See _warm_up_socketio_aut()'s docstring — pays for a slow
+                # first-call cold start here, once, before it can corrupt a
+                # real scored round.
+                await asyncio.to_thread(_warm_up_socketio_aut, aut_config)
             elif start_request.connection.mode == "direct_http":
                 # build_custom_endpoint_config() is pure field-mapping too —
                 # no network call, cannot raise AUTAuthError.

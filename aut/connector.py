@@ -157,9 +157,9 @@ class SocketIOEndpointConfig(BaseModel):
     thread_id: Optional[str] = None
     persist_thread: bool = False
     connect_timeout_seconds: float = 15.0
-    response_timeout_seconds: float = 120.0
+    response_timeout_seconds: float = 180.0
     http_session_timeout_seconds: float = 30.0  # low-level HTTP read timeout for polling handshake
-    token_silence_timeout_seconds: float = 35.0  # if tokens stop arriving for this long, treat stream as done
+    token_silence_timeout_seconds: float = 150.0# if tokens stop arriving for this long, treat stream as done
     origin_header: Optional[str] = None  # e.g. "https://assetcct.navigatto.ai" — sent as
     # the HTTP Origin header on the polling upgrade request so servers that
     # enforce CORS/origin checks accept the connection.
@@ -348,10 +348,66 @@ def _call_custom_endpoint(task: str, config: CustomEndpointConfig) -> AUTRespons
     )
 
 
+def _format_chat_data_event(data: dict) -> Optional[str]:
+    """Turn one chat:data payload into Judge-readable text, or None if this
+    event type isn't part of the AUT's actual answer.
+
+    Only 'results' (the table/chart data itself) and 'sql' (the query that
+    produced it -- useful context for the Judge's accuracy scoring) are
+    captured. 'suggestions' (follow-up prompt chips) and 'agent_status'
+    (internal pipeline progress like stage="executing") are UI/telemetry,
+    not content the AUT is asserting as its answer -- never appended to
+    output text. See integration 3.md's chat:data payload shapes.
+
+    Row count is defensively capped here even though the server-side
+    payload is already documented as a bounded preview (<=10 rows per
+    integration 3.md) -- cheap insurance against a larger payload turning
+    into an oversized Judge prompt.
+    """
+    event = data.get("event")
+
+    if event == "results":
+        columns = data.get("columns") or []
+        rows = data.get("rows") or []
+        total_rows = data.get("total_rows")
+        shown_rows = data.get("shown_rows", len(rows))
+
+        row_cap = 25
+        display_rows = rows[:row_cap]
+
+        lines = [
+            f"[DATA RESULT \u2014 {len(columns)} column(s), "
+            f"showing {shown_rows} of {total_rows if total_rows is not None else len(rows)} row(s)]"
+        ]
+        if columns:
+            lines.append("Columns: " + ", ".join(str(c) for c in columns))
+        for row in display_rows:
+            if isinstance(row, dict):
+                lines.append(" | ".join(f"{k}={v}" for k, v in row.items()))
+            else:
+                lines.append(str(row))
+        if len(rows) > row_cap:
+            lines.append(f"... ({len(rows) - row_cap} more row(s) omitted)")
+        return "\n".join(lines)
+
+    if event == "sql":
+        sql = data.get("sql")
+        if isinstance(sql, str) and sql.strip():
+            return f"[GENERATED SQL]\n{sql.strip()}"
+        return None
+
+    return None
+
+
 def _call_socketio_endpoint(task: str, config: SocketIOEndpointConfig) -> AUTResponse:
     import socketio  # local import: keeps python-socketio optional for the other 4 modes
 
     tokens: list[str] = []
+    # Formatted text blocks from chat:data 'results'/'sql' events, in arrival
+    # order -- kept separate from `tokens` so the existing chat:token count
+    # in the timeout error message (len(tokens)) stays accurate to what it
+    # says: narration tokens specifically, not data events.
+    captured_data_blocks: list[str] = []
     start_payload: dict[str, Any] = {}
     error_message: dict[str, str] = {}
     finished = threading.Event()
@@ -378,6 +434,19 @@ def _call_socketio_endpoint(task: str, config: SocketIOEndpointConfig) -> AUTRes
         if isinstance(content, str):
             tokens.append(content)
             _last_token_time.append(time.perf_counter())
+
+    @client.on("chat:data")
+    def _on_data(data=None):
+        if not isinstance(data, dict):
+            return
+        # A chat:data event (e.g. the backend building a table/chart) means
+        # the stream is still alive even during a stretch with no chat:token
+        # activity -- refresh the silence clock so that legitimate working
+        # time isn't mistaken for a dead stream by _silence_watcher below.
+        _last_token_time.append(time.perf_counter())
+        formatted = _format_chat_data_event(data)
+        if formatted:
+            captured_data_blocks.append(formatted)
 
     @client.on("chat:error")
     def _on_error(data=None):
@@ -437,8 +506,10 @@ def _call_socketio_endpoint(task: str, config: SocketIOEndpointConfig) -> AUTRes
         client.disconnect()
     latency_ms = (time.perf_counter() - start) * 1000
 
-    # Silence fallback counts as success if we actually got tokens
-    if silence_triggered.is_set() and tokens:
+    # Silence fallback counts as success if we actually got tokens OR captured
+    # data (a results/sql-only answer with little/no narration shouldn't be
+    # treated as empty just because `tokens` itself is short).
+    if silence_triggered.is_set() and (tokens or captured_data_blocks):
         got_terminal_event = True
 
     if not got_terminal_event:
@@ -456,8 +527,17 @@ def _call_socketio_endpoint(task: str, config: SocketIOEndpointConfig) -> AUTRes
         if isinstance(new_thread_id, str) and new_thread_id:
             config.thread_id = new_thread_id
 
+    # Narration first, then any captured results/sql blocks appended after --
+    # not interleaved in exact original arrival order (that would need one
+    # shared ordered list instead of two). For the typical narrate-then-
+    # data-then-done shape this AUT follows, that simplification doesn't
+    # lose anything the Judge needs; it just isn't byte-for-byte replay.
+    output_text = "".join(tokens)
+    if captured_data_blocks:
+        output_text += ("\n\n" if output_text else "") + "\n\n".join(captured_data_blocks)
+
     return AUTResponse(
-        output="".join(tokens),
+        output=output_text,
         latency_ms=latency_ms,
         # Streaming chat backends built like this one generally don't report
         # token/cost accounting over the socket -- left as None rather than

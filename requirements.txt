@@ -1,12 +1,28 @@
-# EvalMind — verified working dependency set (installed & smoke-tested)
-# crewai[tools,anthropic] pulls in native Anthropic support alongside the default
-# OpenAI/litellm path, so config/llm_config.py can switch providers via .env
-# without touching this file.
+# EvalMind — single requirements file for the whole project.
+# One venv, one install: pip install -r requirements.txt
+#
+# crewai[tools,anthropic,google-genai] pulls in native provider support so
+# config/llm_config.py can switch providers via .env with no code changes.
 crewai[tools,anthropic,google-genai]==1.15.16
 python-dotenv==1.2.3
 pydantic==2.12.5
 litellm
 
-# aut/connector.py's "custom_endpoint" mode calls this directly (it was
-# previously only a transitive dependency of crewai).
+# aut/connector.py — HTTP and Socket.IO AUT modes
 requests==2.34.2
+python-socketio[asyncio_client]
+
+# Backend web server (backend/app/main.py — FastAPI + WebSocket)
+# uvicorn pinned to >=0.50.2: that's the first release requiring/using the
+# websockets-sansio implementation by default, which is what's actually
+# compatible with modern `websockets` (16.x, installed below via the
+# [standard] extra). uvicorn==0.34.0 only spoke to websockets.legacy, an
+# API `websockets` deprecated back in 14.0 — running 0.34.0 against a
+# current websockets install is exactly what caused the WS connection to
+# open/close unpredictably during live eval runs.
+fastapi==0.115.6
+uvicorn[standard]>=0.50.2
+
+# httpx is a transitive fastapi/starlette dep, pinned explicitly because
+# backend/tests/test_ws_flow.py uses fastapi.testclient.TestClient which requires it.
+httpx==0.28.1

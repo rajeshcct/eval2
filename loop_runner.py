@@ -3,9 +3,12 @@ loop_runner.py
 
 Block E - the escalating difficulty loop that finds each category's
 "breaking point": instead of running one round per category and reporting a
-single pass/fail (Block D's run_single_round), run_category_loop() keeps
-escalating difficulty round after round until the AUT either fails a round
-or survives every round up to max_rounds.
+single pass/fail (Block D's run_single_round), run_category_loop() always
+runs every round up to max_rounds, escalating difficulty round after
+round regardless of whether earlier rounds passed or failed. A failure no
+longer stops the loop early - it's recorded (the first failing round
+becomes the category's breaking_point) and the loop keeps going, so every
+category always contributes the same number of rounds to the final report.
 
 Every round still goes through the exact same pipeline.run_single_round()
 Generator -> AUT -> Judge -> db.store chain from Block D, completely
@@ -32,10 +35,11 @@ VALID_STATUSES = ("broken", "robust_within_tested_range")
 class CategoryLoopResult(BaseModel):
     """Everything produced by one category's escalating loop.
 
-    breaking_point is the round_number of the first round that FAILED, or
-    None if every round up to max_rounds passed. rounds holds every
-    RoundResult that actually ran - 1 up to and including the failing round,
-    or all max_rounds if the AUT never failed.
+    breaking_point is the round_number of the FIRST round that failed, or
+    None if every round up to max_rounds passed. The loop no longer stops
+    at the first failure - rounds always holds every RoundResult for all
+    max_rounds rounds, whether or not (and however many times) the AUT
+    failed along the way.
     """
 
     category: str
@@ -55,16 +59,19 @@ def run_category_loop(
     on_event: Optional[OnEvent] = None,
 ) -> CategoryLoopResult:
     """
-    Escalate difficulty for ONE category, round by round, until the AUT
-    fails a round or survives max_rounds.
+    Escalate difficulty for ONE category, round by round, for all
+    max_rounds rounds - a failed round no longer cuts the loop short.
 
-    Round 1 runs at start_difficulty. Every time a round PASSES, difficulty
-    increases by difficulty_step (capped at MAX_DIFFICULTY=5) and the loop
-    moves on to the next round_number. The first round that FAILS stops the
-    loop immediately and that round's round_number becomes the category's
-    breaking_point. If every round up to max_rounds passes, breaking_point
-    stays None and status is "robust_within_tested_range"; otherwise status
-    is "broken".
+    Round 1 runs at start_difficulty. After EVERY round - pass or fail -
+    difficulty increases by difficulty_step (capped at MAX_DIFFICULTY=5)
+    and the loop moves on to the next round_number, all the way through
+    max_rounds. The first round that FAILS sets the category's
+    breaking_point to that round's round_number and flips status to
+    "broken" - but the loop keeps running the remaining rounds regardless
+    (their results are still recorded in `rounds`; only the first failure
+    is ever recorded as the breaking_point). If every round up to
+    max_rounds passes, breaking_point stays None and status is
+    "robust_within_tested_range".
 
     Args:
         category: "functionality" | "security" | "compliance".
@@ -99,8 +106,8 @@ def run_category_loop(
 
     Returns:
         A CategoryLoopResult with the category, final status, breaking_point
-        (or None), and the full list of RoundResult objects for every round
-        that actually ran.
+        (the first failing round's number, or None), and the full list of
+        RoundResult objects for all max_rounds rounds.
 
     Raises:
         ValueError: for an invalid category/max_rounds/start_difficulty (or
@@ -149,13 +156,15 @@ def run_category_loop(
         )
         rounds.append(result)
 
-        if not result.passed:
+        if not result.passed and breaking_point is None:
+            # Record only the FIRST failure as the breaking point - later
+            # failures in this same loop don't overwrite it - but no
+            # longer stop the loop: every category always runs all
+            # max_rounds rounds.
             breaking_point = round_number
             status = "broken"
-            break
 
         if round_number >= max_rounds:
-            # Passed every round up to the cap without ever breaking.
             break
 
         difficulty = min(difficulty + difficulty_step, MAX_DIFFICULTY)

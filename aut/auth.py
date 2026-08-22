@@ -155,6 +155,16 @@ class SocketIOConnectionRequest(BaseModel):
     socketio_path: Optional[str] = None
     chat_message_event: Optional[str] = None
 
+    # Advanced/optional — max seconds of no chat:token/chat:data activity
+    # before the response is treated as finished (see
+    # SocketIOEndpointConfig's own docstring / _silence_watcher in
+    # aut/connector.py). Left None = use that class's fixed 150.0s default.
+    # Raise this for AUTs with slow-but-alive backend pauses (e.g. a cold
+    # container or slow query on the first call of a session) that
+    # otherwise get mistaken for "done" and truncated mid-response. Must
+    # stay below response_timeout_seconds or the hard timeout wins first.
+    token_silence_timeout_seconds: Optional[float] = None
+
 
 def build_socketio_endpoint_config(
     connection: SocketIOConnectionRequest,
@@ -178,6 +188,8 @@ def build_socketio_endpoint_config(
         kwargs["socketio_path"] = connection.socketio_path
     if connection.chat_message_event:
         kwargs["chat_message_event"] = connection.chat_message_event
+    if connection.token_silence_timeout_seconds is not None:
+        kwargs["token_silence_timeout_seconds"] = connection.token_silence_timeout_seconds
     return SocketIOEndpointConfig(**kwargs)
 
 

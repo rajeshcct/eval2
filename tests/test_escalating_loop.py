@@ -39,12 +39,13 @@ mode (reading tests/sample_manual_outputs.json), db/store.py's actual
 SQLite inserts, and all of loop_runner.py's / pipeline.py's own control flow.
 
 Two cases, per the spec:
-  1. "security" fails partway through -> status="broken". Deliberately made
-     to fail at round 2 of 3 (NOT round 3 of 3, the spec's own example) -
-     if it failed on the very last allowed round, the DB row count would be
-     max_rounds either way and wouldn't actually prove the loop stops
-     early. Failing at round 2 makes the "stopped early" (2 rows) vs
-     "ran the full cap" (3 rows) distinction real and checkable.
+  1. "security" fails partway through (round 2 of 3) -> status="broken",
+     breaking_point=2 - but the loop no longer stops there. It keeps going
+     through max_rounds regardless of the failure, still escalating
+     difficulty every round, so this case now proves the OPPOSITE of what
+     it used to: that a failure at round 2 does NOT cut the run short -
+     all 3 rounds still get stored, and round 2 stays the recorded
+     breaking_point even though round 3 also ran.
   2. "functionality" passes every round -> status="robust_within_tested_range",
      breaking_point=None, and all max_rounds rounds get stored.
 
@@ -121,7 +122,10 @@ def _patched_run_category_loop(*args, **kwargs):
 # --------------------------------------------------------------------------
 def test_breaks_partway() -> bool:
     print("=" * 78)
-    print("CASE 1: security fails at round 2 of 3 -> expect status='broken', breaking_point=2")
+    print(
+        "CASE 1: security fails at round 2 of 3 -> expect status='broken', "
+        "breaking_point=2, but ALL 3 rounds still run (failure no longer stops the loop)"
+    )
     print("=" * 78)
 
     session_id = str(uuid.uuid4())
@@ -147,26 +151,35 @@ def test_breaks_partway() -> bool:
     if summary.breaking_point != 2:
         print(f"  [ERROR] expected breaking_point=2, got {summary.breaking_point!r}")
         ok = False
-    if len(summary.rounds) != 2:
-        print(f"  [ERROR] expected exactly 2 rounds to have run, got {len(summary.rounds)}")
-        ok = False
-    if summary.rounds and summary.rounds[-1].passed is not False:
-        print("  [ERROR] the last (breaking) round should have passed=False")
+    if len(summary.rounds) != MAX_ROUNDS:
+        print(f"  [ERROR] expected all {MAX_ROUNDS} rounds to have run despite the round-2 "
+              f"failure, got {len(summary.rounds)}")
         ok = False
     if summary.rounds and summary.rounds[0].passed is not True:
         print("  [ERROR] round 1 should have passed=True (it escalated to round 2 at all)")
         ok = False
+    if len(summary.rounds) >= 2 and summary.rounds[1].passed is not False:
+        print("  [ERROR] round 2 (the recorded breaking_point) should have passed=False")
+        ok = False
+    # Difficulty keeps escalating after a failure now, same as after a pass -
+    # round 3 should be at difficulty 3, not frozen at round 2's difficulty.
+    if len(summary.rounds) == MAX_ROUNDS and summary.rounds[-1].difficulty != MAX_ROUNDS:
+        print(
+            f"  [ERROR] expected difficulty to keep escalating past the round-2 failure "
+            f"(round {MAX_ROUNDS} at difficulty {MAX_ROUNDS}), got {summary.rounds[-1].difficulty}"
+        )
+        ok = False
 
-    # DB check: exactly 2 rows for this category/session (stopped early, not
-    # all 3 - see module docstring for why round 2, not round 3, was chosen).
+    # DB check: all MAX_ROUNDS rows for this category/session now get
+    # stored, even though round 2 failed - the loop no longer stops early.
     rows = get_rounds_for_session(session_id)
     security_rows = [r for r in rows if r["category"] == "security"]
-    if len(security_rows) != 2:
-        print(f"  [ERROR] expected exactly 2 stored rounds in DB, found {len(security_rows)}")
+    if len(security_rows) != MAX_ROUNDS:
+        print(f"  [ERROR] expected exactly {MAX_ROUNDS} stored rounds in DB, found {len(security_rows)}")
         ok = False
     round_numbers = sorted(r["round_number"] for r in security_rows)
-    if round_numbers != [1, 2]:
-        print(f"  [ERROR] expected stored round_numbers [1, 2], got {round_numbers}")
+    if round_numbers != list(range(1, MAX_ROUNDS + 1)):
+        print(f"  [ERROR] expected stored round_numbers {list(range(1, MAX_ROUNDS + 1))}, got {round_numbers}")
         ok = False
 
     print(f"  {'OK' if ok else 'FAILED'}\n")

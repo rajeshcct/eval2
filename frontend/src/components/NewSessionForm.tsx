@@ -38,9 +38,10 @@ interface NewSessionFormProps {
  *
  * A "Connection type" selector at the top switches between HTTP/REST (the
  * above) and Socket.IO (JWT) — chat_endpoint_url / bearer_token /
- * origin_header, with socketio_path / chat_message_event behind their own
- * "Advanced" disclosure, mirroring aut/auth.py::SocketIOConnectionRequest.
- * Whichever type is active is what gets submitted as `connection`.
+ * origin_header, with socketio_path / chat_message_event /
+ * token_silence_timeout_seconds behind their own "Advanced" disclosure,
+ * mirroring aut/auth.py::SocketIOConnectionRequest. Whichever type is
+ * active is what gets submitted as `connection`.
  *
  * Phase V adds a second, independent affordance below the form itself: a
  * plain session_id input + "View report" button that calls onLoadReport,
@@ -54,7 +55,7 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
   );
   const [connection, setConnection] = useState<AUTConnectionRequest>(defaultAUTConnectionRequest());
   const [socketioConnection, setSocketioConnection] = useState<SocketIOConnectionRequest>(
-    defaultSocketIOConnectionRequest(),
+    defaultSocketioConnectionRequest_safe(),
   );
   const [directHttpConnection, setDirectHttpConnection] = useState<CustomEndpointConnectionRequest>(
     defaultCustomEndpointConnectionRequest(),
@@ -511,6 +512,62 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
                     />
                   </div>
                 </div>
+
+                <div className="flex flex-col gap-2">
+                  <label
+                    htmlFor="socketio_response_timeout_seconds"
+                    className="text-sm font-medium text-slate-200"
+                  >
+                    Response timeout (seconds)
+                  </label>
+                  <input
+                    id="socketio_response_timeout_seconds"
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={socketioConnection.response_timeout_seconds}
+                    onChange={(e) =>
+                      updateSocketioConnection("response_timeout_seconds", Number(e.target.value))
+                    }
+                    className="w-32 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  />
+                  <p className="text-xs text-slate-500">
+                    Keep this above the token silence timeout below (150s by default) — the hard
+                    timeout can't fire after the silence fallback already has, only before.
+                  </p>
+                </div>
+
+                <div className="flex flex-col gap-2">
+                  <label
+                    htmlFor="socketio_token_silence_timeout_seconds"
+                    className="text-sm font-medium text-slate-200"
+                  >
+                    Token silence timeout (seconds){" "}
+                    <span className="text-slate-500">(optional)</span>
+                  </label>
+                  <input
+                    id="socketio_token_silence_timeout_seconds"
+                    type="number"
+                    min={1}
+                    step={1}
+                    placeholder="150 (connector default)"
+                    value={socketioConnection.token_silence_timeout_seconds ?? ""}
+                    onChange={(e) =>
+                      updateSocketioConnection(
+                        "token_silence_timeout_seconds",
+                        e.target.value.trim() ? Number(e.target.value) : undefined,
+                      )
+                    }
+                    className="w-40 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  />
+                  <p className="text-xs text-slate-500">
+                    How long the AUT can go quiet (no streamed tokens/data) before its response is
+                    treated as finished. Raise this if an AUT has a slow-but-alive pause — e.g. a
+                    cold container or slow query on the first call of a session — that's getting
+                    mistaken for "done" and truncating the response. Must stay below the response
+                    timeout above.
+                  </p>
+                </div>
               </div>
             )}
           </>
@@ -653,4 +710,8 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
       </div>
     </div>
   );
+}
+
+function defaultSocketioConnectionRequest_safe(): SocketIOConnectionRequest {
+  return defaultSocketIOConnectionRequest();
 }
