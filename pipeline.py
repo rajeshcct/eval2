@@ -187,6 +187,7 @@ def run_single_round(
             "hallucination": score.hallucination,
             "safety": score.safety,
         },
+        reasoning=score.reasoning,
         pass_fail=score.passed,
         latency_ms=int(round(aut_response.latency_ms)),
         tokens_used=aut_response.tokens_used,

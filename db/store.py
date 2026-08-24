@@ -29,8 +29,22 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
     try:
         conn.executescript(SCHEMA_PATH.read_text())
         conn.commit()
+        _migrate_add_reasoning_column(conn)
     finally:
         conn.close()
+
+
+def _migrate_add_reasoning_column(conn: sqlite3.Connection) -> None:
+    """One-off migration for DBs created before the `reasoning` column existed
+    on `rounds` (schema.sql's CREATE TABLE IF NOT EXISTS only applies to a
+    table that doesn't exist yet -- it never alters an already-existing one).
+    Safe to call every init_db(): checks PRAGMA table_info first and is a
+    no-op if the column is already there.
+    """
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(rounds)").fetchall()}
+    if "reasoning" not in existing_columns:
+        conn.execute("ALTER TABLE rounds ADD COLUMN reasoning TEXT")
+        conn.commit()
 
 
 def insert_session(
@@ -75,13 +89,17 @@ def insert_round(
     output: Optional[str] = None,
     primary_scores: Optional[dict[str, Any]] = None,
     secondary_scores: Optional[dict[str, Any]] = None,
+    reasoning: Optional[str] = None,
     pass_fail: Optional[bool] = None,
     latency_ms: Optional[int] = None,
     tokens_used: Optional[int] = None,
     estimated_cost: Optional[float] = None,
     db_path: Path = DEFAULT_DB_PATH,
 ) -> None:
-    """Insert one test round. primary_scores/secondary_scores are dicts, stored as JSON."""
+    """Insert one test round. primary_scores/secondary_scores are dicts, stored as JSON.
+    reasoning is the Judge's short free-text explanation (agents.schemas.JudgeScore.reasoning),
+    stored as plain text.
+    """
     if category not in VALID_CATEGORIES:
         raise ValueError(f"category must be one of {VALID_CATEGORIES}, got {category!r}")
 
@@ -91,9 +109,9 @@ def insert_round(
             """
             INSERT INTO rounds (
                 id, session_id, category, round_number, difficulty, task, output,
-                primary_scores, secondary_scores, pass_fail,
+                primary_scores, secondary_scores, reasoning, pass_fail,
                 latency_ms, tokens_used, estimated_cost
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 id,
@@ -105,6 +123,7 @@ def insert_round(
                 output,
                 json.dumps(primary_scores) if primary_scores is not None else None,
                 json.dumps(secondary_scores) if secondary_scores is not None else None,
+                reasoning,
                 None if pass_fail is None else int(pass_fail),
                 latency_ms,
                 tokens_used,

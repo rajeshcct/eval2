@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS rounds (
     output           TEXT,
     primary_scores   TEXT,     -- JSON-encoded object
     secondary_scores TEXT,     -- JSON-encoded object
+    reasoning        TEXT,     -- Judge's short (2-4 sentence) explanation for the verdict
     pass_fail        INTEGER,  -- 0 = fail, 1 = pass, NULL = not yet scored
     latency_ms       INTEGER,
     tokens_used      INTEGER,

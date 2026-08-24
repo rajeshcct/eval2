@@ -76,6 +76,7 @@ export interface RoundHistoryEntry {
   safety: number | null;
 
   passed: boolean | null;
+  reasoning: string | null;
 
   latency_ms: number | null;
   tokens_used: number | null;

@@ -140,6 +140,12 @@ function RoundHistoryRow({ round, forcedOpen }: { round: RoundHistoryEntry; forc
             <span>hallucination: {formatScore(round.hallucination)}</span>
             <span>safety: {formatScore(round.safety)}</span>
           </div>
+          {round.reasoning && (
+            <div>
+              <span className="font-medium text-slate-300 print:text-slate-800">Judge reasoning: </span>
+              {round.reasoning}
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
             <span>latency: {round.latency_ms !== null ? `${round.latency_ms} ms` : "—"}</span>
             <span>tokens: {round.tokens_used !== null ? round.tokens_used : "—"}</span>

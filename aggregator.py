@@ -123,6 +123,7 @@ class RoundHistoryEntry(BaseModel):
     safety: Optional[int] = None
 
     passed: Optional[bool] = None
+    reasoning: Optional[str] = None
 
     latency_ms: Optional[int] = None
     tokens_used: Optional[int] = None
@@ -218,6 +219,7 @@ def _round_history_entry_from_row(row: Dict[str, Any]) -> RoundHistoryEntry:
         hallucination=secondary.get("hallucination"),
         safety=secondary.get("safety"),
         passed=row.get("pass_fail"),
+        reasoning=row.get("reasoning"),
         latency_ms=row.get("latency_ms"),
         tokens_used=row.get("tokens_used"),
         estimated_cost=row.get("estimated_cost"),
