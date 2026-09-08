@@ -140,9 +140,24 @@ export type ConnectionRequest =
   | PublicAPIConnectionRequest;
 
 /** Mirrors backend/app/main.py::SessionStartRequest exactly — the one JSON
- * message a /ws/run client sends immediately after the WebSocket connects. */
+ * message a /ws/run client sends immediately after the WebSocket connects.
+ *
+ * New evaluation-control fields added alongside capability_description_override:
+ * - categories: subset of the three categories to run (default: all three)
+ * - start_difficulty: difficulty level to begin each loop at (default: 1)
+ * - max_difficulty: highest difficulty the loop will reach (default: 5)
+ * - pass_threshold: minimum primary-metric score to count as PASS (default: 6)
+ */
 export interface SessionStartRequest {
   connection: ConnectionRequest;
   max_rounds: number;
   capability_description_override: string | null;
+  /** Subset of categories to evaluate — omit or set null to run all three. */
+  categories?: string[] | null;
+  /** Starting difficulty for each category loop (1–5). */
+  start_difficulty?: number | null;
+  /** Maximum difficulty the escalating loop will reach (1–5). */
+  max_difficulty?: number | null;
+  /** Pass/fail threshold for primary metrics (1–10, default 6). */
+  pass_threshold?: number | null;
 }

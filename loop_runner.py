@@ -57,6 +57,8 @@ def run_category_loop(
     difficulty_step: int = 1,
     session_id: Optional[str] = None,
     on_event: Optional[OnEvent] = None,
+    max_difficulty: int = MAX_DIFFICULTY,
+    pass_threshold: Optional[int] = None,
 ) -> CategoryLoopResult:
     """
     Escalate difficulty for ONE category, round by round, for all
@@ -145,6 +147,9 @@ def run_category_loop(
     status = "robust_within_tested_range"
 
     while True:
+        # Pass all rounds completed so far in this category loop so the
+        # Generator can ask context-aware follow-up tasks (round 1 gets an
+        # empty list, which the Generator treats as "no prior context").
         result = run_single_round(
             category=category,
             capability_description=capability_description,
@@ -153,6 +158,8 @@ def run_category_loop(
             session_id=session_id,
             round_number=round_number,
             on_event=on_event,
+            pass_threshold=pass_threshold,
+            prior_rounds=rounds if rounds else None,
         )
         rounds.append(result)
 
@@ -167,7 +174,7 @@ def run_category_loop(
         if round_number >= max_rounds:
             break
 
-        difficulty = min(difficulty + difficulty_step, MAX_DIFFICULTY)
+        difficulty = min(difficulty + difficulty_step, max_difficulty)
         round_number += 1
 
     loop_result = CategoryLoopResult(

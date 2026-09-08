@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { CategoryReport, FinalReport, RoundHistoryEntry } from "../lib/ws";
+import { deleteSession, rejudgeSession } from "../lib/ws";
 
 const CATEGORY_ORDER = ["functionality", "security", "compliance"] as const;
 
@@ -489,6 +490,9 @@ function VerdictStamp({ allRobust }: { allRobust: boolean }) {
  */
 export default function ReportView({ report, onReset }: ReportViewProps) {
   const [expandAllForPrint, setExpandAllForPrint] = useState(false);
+  const [currentReport, setCurrentReport] = useState<FinalReport>(report);
+  const [rejudging, setRejudging] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   // Revert the forced-open state once the print dialog closes (or the
   // "Save as PDF" flow finishes/cancels) so the on-screen accordion goes
@@ -503,32 +507,84 @@ export default function ReportView({ report, onReset }: ReportViewProps) {
 
   function handleDownloadPdf() {
     setExpandAllForPrint(true);
-    // Let the expanded round detail render before invoking the browser's
-    // print pipeline, so "Save as PDF" captures the full report rather
-    // than whatever accordion state was on screen.
     requestAnimationFrame(() => {
       requestAnimationFrame(() => window.print());
     });
   }
 
-  const presentCategories = CATEGORY_ORDER.map((c) => report.categories[c]).filter(
+  function handleDownloadJson() {
+    const blob = new Blob([JSON.stringify(currentReport, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `evalmind-report-${currentReport.session_id.slice(0, 8)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function handleRejudge() {
+    if (!confirm("Re-run the Judge over all existing rounds? This overwrites the stored scores and rebuilds the report.")) return;
+    setRejudging(true);
+    try {
+      const updated = await rejudgeSession(currentReport.session_id);
+      setCurrentReport(updated);
+    } catch (e) {
+      alert(`Re-judge failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setRejudging(false);
+    }
+  }
+
+  async function handleDelete() {
+    if (!confirm("Delete this session and all its rounds? This cannot be undone.")) return;
+    setDeleting(true);
+    try {
+      await deleteSession(currentReport.session_id);
+      onReset();
+    } catch (e) {
+      alert(`Delete failed: ${e instanceof Error ? e.message : String(e)}`);
+      setDeleting(false);
+    }
+  }
+
+  const presentCategories = CATEGORY_ORDER.map((c) => currentReport.categories[c]).filter(
     (c): c is CategoryReport => Boolean(c),
   );
   const allRobust = presentCategories.length > 0 && presentCategories.every((c) => c.status !== "broken");
   const glanceEntries = CATEGORY_ORDER.flatMap((c) => {
-    const cat = report.categories[c];
+    const cat = currentReport.categories[c];
     return cat ? [{ key: c, report: cat }] : [];
   });
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 print:max-w-none print:gap-3">
       {/* Toolbar — screen only, no equivalent on the printed page. */}
-      <div className="flex items-center justify-end gap-2 print:hidden">
+      <div className="flex flex-wrap items-center justify-end gap-2 print:hidden">
+        <button
+          onClick={() => void handleRejudge()}
+          disabled={rejudging}
+          className="rounded-md border border-amber-800 bg-amber-950/30 px-3 py-1.5 text-sm font-medium text-amber-200 hover:bg-amber-900/50 disabled:opacity-50"
+        >
+          {rejudging ? "Re-judging…" : "Re-judge rounds"}
+        </button>
+        <button
+          onClick={handleDownloadJson}
+          className="rounded-md border border-slate-700 px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-800"
+        >
+          Export JSON
+        </button>
         <button
           onClick={handleDownloadPdf}
           className="rounded-md border border-indigo-700 bg-indigo-950/40 px-3 py-1.5 text-sm font-medium text-indigo-200 hover:bg-indigo-900/50"
         >
           Download PDF
+        </button>
+        <button
+          onClick={() => void handleDelete()}
+          disabled={deleting}
+          className="rounded-md border border-red-900 px-3 py-1.5 text-sm text-red-400 hover:bg-red-950/50 disabled:opacity-50"
+        >
+          {deleting ? "Deleting…" : "Delete session"}
         </button>
         <button
           onClick={onReset}
@@ -549,12 +605,12 @@ export default function ReportView({ report, onReset }: ReportViewProps) {
 
         <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-xs text-slate-500 print:text-slate-600">
           <span>session</span>
-          <span className="text-slate-300 print:text-slate-800">{report.session_id}</span>
-          <CopySessionId sessionId={report.session_id} />
+          <span className="text-slate-300 print:text-slate-800">{currentReport.session_id}</span>
+          <CopySessionId sessionId={currentReport.session_id} />
           <span className="mx-1 text-slate-700 print:text-slate-400">·</span>
-          <span>started {formatDateTime(report.started_at)}</span>
+          <span>started {formatDateTime(currentReport.started_at)}</span>
           <span className="mx-1 text-slate-700 print:text-slate-400">·</span>
-          <span>generated {formatDateTime(report.generated_at)}</span>
+          <span>generated {formatDateTime(currentReport.generated_at)}</span>
         </div>
 
         {presentCategories.length > 0 && (
@@ -570,32 +626,32 @@ export default function ReportView({ report, onReset }: ReportViewProps) {
         <h2 className="font-mono text-xs font-medium uppercase tracking-wide text-slate-500 print:text-slate-600">
           System Under Test
         </h2>
-        <p className="mt-1 text-sm text-slate-300 print:text-slate-800">{report.aut_description}</p>
+        <p className="mt-1 text-sm text-slate-300 print:text-slate-800">{currentReport.aut_description}</p>
       </section>
 
       <section className="rounded-lg border border-indigo-800/60 bg-indigo-950/20 p-4 print:border-indigo-300 print:bg-indigo-50">
         <h2 className="font-serif text-sm font-semibold uppercase tracking-wide text-indigo-300 print:text-indigo-800">
           Overall Verdict
         </h2>
-        <p className="mt-2 text-sm leading-relaxed text-slate-200 print:text-slate-800">{report.overall_verdict}</p>
+        <p className="mt-2 text-sm leading-relaxed text-slate-200 print:text-slate-800">{currentReport.overall_verdict}</p>
       </section>
 
       <div className="flex flex-col gap-4">
         {CATEGORY_ORDER.map((category) => {
-          const cat = report.categories[category];
+          const cat = currentReport.categories[category];
           return cat ? (
             <CategorySection key={category} category={category} report={cat} forcedOpen={expandAllForPrint} />
           ) : null;
         })}
       </div>
 
-      <PerformanceSummary perf={report.performance_and_cost} />
+      <PerformanceSummary perf={currentReport.performance_and_cost} />
 
       {/* Footer — print only, gives every page a source line since a
        * multi-page PDF can be separated from the on-screen context it
        * was generated in. */}
       <div className="hidden print:mt-2 print:block print:border-t print:border-slate-300 print:pt-2 print:text-center print:font-mono print:text-[10px] print:text-slate-400">
-        EvalMind — session {report.session_id} — generated {formatDateTime(report.generated_at)}
+        EvalMind — session {currentReport.session_id} — generated {formatDateTime(currentReport.generated_at)}
       </div>
     </div>
   );

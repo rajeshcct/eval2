@@ -82,6 +82,10 @@ def run_full_session(
     max_rounds: int = 5,
     capability_description_override: Optional[str] = None,
     on_event: Optional[OnEvent] = None,
+    categories: Optional[list] = None,
+    start_difficulty: int = 1,
+    max_difficulty: int = 5,
+    pass_threshold: Optional[int] = None,
 ) -> SessionResult:
     """
     Run the full EvalMind evaluation: auto-discover the AUT's capability
@@ -157,8 +161,12 @@ def run_full_session(
     session_id = str(uuid.uuid4())
     insert_session(session_id, aut_description=capability_description)
 
+    active_categories = categories if categories else list(CATEGORIES)
+
     summaries: Dict[str, CategoryLoopResult] = {}
     for category in CATEGORIES:
+        if category not in active_categories:
+            continue
         summaries[category] = run_category_loop(
             category=category,
             capability_description=capability_description,
@@ -166,6 +174,9 @@ def run_full_session(
             max_rounds=max_rounds,
             session_id=session_id,
             on_event=on_event,
+            start_difficulty=start_difficulty,
+            max_difficulty=max_difficulty,
+            pass_threshold=pass_threshold,
         )
 
     # Block G: one call builds AND persists the FinalReport, from the DB

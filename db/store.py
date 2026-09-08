@@ -196,6 +196,75 @@ def insert_final_report(
         conn.close()
 
 
+def list_sessions(limit: int = 50, db_path: Path = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    """Fetch the most-recent sessions (up to `limit`), newest first.
+    Returns lightweight rows: id, aut_description, started_at.
+    A final_report row existing means the session completed.
+    """
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT s.id, s.aut_description, s.started_at,
+                   CASE WHEN fr.session_id IS NOT NULL THEN 1 ELSE 0 END AS has_report
+            FROM sessions s
+            LEFT JOIN final_reports fr ON fr.session_id = s.id
+            ORDER BY s.started_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def delete_session(session_id: str, db_path: Path = DEFAULT_DB_PATH) -> bool:
+    """Delete a session and all its rounds + final_report (CASCADE).
+    Returns True if a row was deleted, False if the id didn't exist.
+    """
+    conn = _connect(db_path)
+    try:
+        cursor = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def update_round_scores(
+    round_id: str,
+    primary_scores: dict[str, Any],
+    secondary_scores: dict[str, Any],
+    reasoning: str,
+    pass_fail: bool,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> None:
+    """Overwrite the judge scores on an existing round row (used by the
+    re-judge endpoint). Does not change task/output/latency/tokens/cost —
+    only the scoring columns.
+    """
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE rounds
+            SET primary_scores = ?, secondary_scores = ?, reasoning = ?, pass_fail = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(primary_scores),
+                json.dumps(secondary_scores),
+                reasoning,
+                int(pass_fail),
+                round_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_final_report(session_id: str, db_path: Path = DEFAULT_DB_PATH) -> Optional[dict[str, Any]]:
     """Fetch the stored final_reports row (session_id, report_json,
     created_at) for a session, or None if none has been generated yet.

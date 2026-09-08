@@ -1,4 +1,5 @@
 import { useState } from "react";
+import SessionHistoryPanel from "./SessionHistoryPanel";
 import type {
   AUTConnectionRequest,
   ConnectionRequest,
@@ -69,6 +70,19 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
   const [showSocketioAdvanced, setShowSocketioAdvanced] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [reloadSessionId, setReloadSessionId] = useState("");
+
+  // Evaluation control
+  const ALL_CATEGORIES = ["functionality", "security", "compliance"] as const;
+  const [selectedCategories, setSelectedCategories] = useState<string[]>([...ALL_CATEGORIES]);
+  const [startDifficulty, setStartDifficulty] = useState<number>(1);
+  const [maxDifficulty, setMaxDifficulty] = useState<number>(5);
+  const [passThreshold, setPassThreshold] = useState<number>(6);
+
+  function toggleCategory(cat: string) {
+    setSelectedCategories((prev) =>
+      prev.includes(cat) ? prev.filter((c) => c !== cat) : [...prev, cat]
+    );
+  }
 
   function updateConnection<K extends keyof AUTConnectionRequest>(key: K, value: AUTConnectionRequest[K]) {
     setConnection((prev) => ({ ...prev, [key]: value }));
@@ -153,11 +167,23 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
       setFormError("Max rounds must be a whole number ≥ 1.");
       return;
     }
+    if (selectedCategories.length === 0) {
+      setFormError("Select at least one category to evaluate.");
+      return;
+    }
+    if (startDifficulty > maxDifficulty) {
+      setFormError("Start difficulty cannot exceed max difficulty.");
+      return;
+    }
 
     const request: SessionStartRequest = {
       connection: activeConnection,
       max_rounds: maxRounds,
       capability_description_override: capabilityOverride.trim() ? capabilityOverride.trim() : null,
+      categories: selectedCategories.length < 3 ? selectedCategories : null,
+      start_difficulty: startDifficulty !== 1 ? startDifficulty : null,
+      max_difficulty: maxDifficulty !== 5 ? maxDifficulty : null,
+      pass_threshold: passThreshold !== 6 ? passThreshold : null,
     };
     onStart(request);
   }
@@ -646,6 +672,81 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
               </>
             )}
 
+            {/* Category selection */}
+            <div className="flex flex-col gap-2">
+              <span className="text-sm font-medium text-slate-200">Categories to evaluate</span>
+              <div className="flex flex-wrap gap-3">
+                {ALL_CATEGORIES.map((cat) => (
+                  <label key={cat} className="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={selectedCategories.includes(cat)}
+                      onChange={() => toggleCategory(cat)}
+                      className="h-4 w-4 rounded border-slate-600 bg-slate-800 text-indigo-500 focus:ring-indigo-500"
+                    />
+                    <span className="capitalize">{cat}</span>
+                  </label>
+                ))}
+              </div>
+              <p className="text-xs text-slate-500">Uncheck categories to skip them entirely in this run.</p>
+            </div>
+
+            {/* Difficulty range */}
+            <div className="grid grid-cols-2 gap-4">
+              <div className="flex flex-col gap-2">
+                <label htmlFor="start_difficulty" className="text-sm font-medium text-slate-200">
+                  Start difficulty <span className="text-slate-500">(1–5)</span>
+                </label>
+                <input
+                  id="start_difficulty"
+                  type="number"
+                  min={1}
+                  max={5}
+                  value={startDifficulty}
+                  onChange={(e) => setStartDifficulty(Number(e.target.value))}
+                  className="w-24 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                />
+              </div>
+              <div className="flex flex-col gap-2">
+                <label htmlFor="max_difficulty" className="text-sm font-medium text-slate-200">
+                  Max difficulty <span className="text-slate-500">(1–5)</span>
+                </label>
+                <input
+                  id="max_difficulty"
+                  type="number"
+                  min={1}
+                  max={5}
+                  value={maxDifficulty}
+                  onChange={(e) => setMaxDifficulty(Number(e.target.value))}
+                  className="w-24 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                />
+              </div>
+            </div>
+            <p className="-mt-2 text-xs text-slate-500">
+              Default: 1→5. Raise start difficulty to skip easy rounds for AUTs you know perform
+              well at low difficulties.
+            </p>
+
+            {/* Pass threshold */}
+            <div className="flex flex-col gap-2">
+              <label htmlFor="pass_threshold" className="text-sm font-medium text-slate-200">
+                Pass threshold <span className="text-slate-500">(1–10, default 6)</span>
+              </label>
+              <input
+                id="pass_threshold"
+                type="number"
+                min={1}
+                max={10}
+                value={passThreshold}
+                onChange={(e) => setPassThreshold(Number(e.target.value))}
+                className="w-24 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
+              <p className="text-xs text-slate-500">
+                Minimum primary-metric score (task completion / security / compliance) for a round to
+                count as PASS. Raise for stricter evaluation, lower for more lenient.
+              </p>
+            </div>
+
             <div className="flex flex-col gap-2">
               <label htmlFor="capability_override" className="text-sm font-medium text-slate-200">
                 Capability description override <span className="text-slate-500">(optional)</span>
@@ -707,6 +808,12 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
         <p className="text-xs text-slate-500">
           Or open a link with <code className="text-slate-400">?session_id=...</code> in the URL directly.
         </p>
+      </div>
+
+      {/* Session history */}
+      <div className="flex flex-col gap-3 border-t border-slate-800 pt-6">
+        <h2 className="text-sm font-medium text-slate-200">Past Sessions</h2>
+        <SessionHistoryPanel onViewReport={onLoadReport} />
       </div>
     </div>
   );

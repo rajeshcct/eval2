@@ -16,11 +16,13 @@ import asyncio
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, model_validator
 
-from aggregator import FinalReport
+from aggregator import FinalReport, build_final_report
+from agents.judge import judge_round, compute_passed
 from aut.auth import (
     ConnectionRequest,
     build_authenticated_endpoint_config,
@@ -30,7 +32,14 @@ from aut.auth import (
 )
 from aut.connector import call_aut
 from config.llm_config import is_configured
-from db.store import get_final_report, init_db
+from db.store import (
+    get_final_report,
+    get_rounds_for_session,
+    init_db,
+    list_sessions,
+    delete_session,
+    update_round_scores,
+)
 from session import run_full_session
 
 # A throwaway prompt sent once, before the real session, whenever a
@@ -62,6 +71,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ==========================================================================
+# Optional API-key guard (set EVALMIND_API_KEY in .env to enable).
+# When set, every /api/* request must include the header
+# X-EvalMind-Key: <value>. WebSocket /ws/run is NOT gated here — the
+# start-message is the gating point there; add header checking inside
+# ws_run() if stricter control is needed.
+# ==========================================================================
+import os as _os
+_EVALMIND_API_KEY = _os.getenv("EVALMIND_API_KEY")  # None = disabled
+
+
+async def _check_api_key(request: Request) -> None:
+    if _EVALMIND_API_KEY is None:
+        return  # guard disabled — no key configured
+    provided = request.headers.get("X-EvalMind-Key", "")
+    if provided != _EVALMIND_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-EvalMind-Key header.")
+
+
 
 # ==========================================================================
 # Request schema
@@ -74,11 +102,22 @@ class SessionStartRequest(BaseModel):
     SocketIOConnectionRequest ("socketio", an already-obtained bearer
     token). max_rounds and capability_description_override map straight
     onto session.run_full_session()'s own parameters of the same name.
+
+    New evaluation-control fields:
+    - categories: subset of ["functionality", "security", "compliance"] to run.
+                  None/absent means all three (existing behavior unchanged).
+    - start_difficulty: first difficulty level (1-5, default 1).
+    - max_difficulty: cap on escalating difficulty (1-5, default 5).
+    - pass_threshold: minimum primary-metric score to count as PASS (1-10, default 6).
     """
 
     connection: ConnectionRequest
     max_rounds: int = 5
     capability_description_override: Optional[str] = None
+    categories: Optional[list[str]] = None
+    start_difficulty: Optional[int] = None
+    max_difficulty: Optional[int] = None
+    pass_threshold: Optional[int] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -213,6 +252,10 @@ async def ws_run(websocket: WebSocket) -> None:
                 max_rounds=start_request.max_rounds,
                 capability_description_override=start_request.capability_description_override,
                 on_event=on_event,
+                categories=start_request.categories or None,
+                start_difficulty=start_request.start_difficulty or 1,
+                max_difficulty=start_request.max_difficulty or 5,
+                pass_threshold=start_request.pass_threshold or None,
             )
         except Exception as e:  # noqa: BLE001 - never let a real failure crash the socket silently
             on_event({"type": "error", "data": {"stage": "session", "message": str(e)}})
@@ -278,3 +321,98 @@ async def get_session_report(session_id: str) -> FinalReport:
 async def health() -> Dict[str, Any]:
     configured = await asyncio.to_thread(is_configured)
     return {"status": "ok", "llm_configured": configured}
+
+
+# ==========================================================================
+# GET /api/sessions — list recent sessions
+# ==========================================================================
+class SessionSummary(BaseModel):
+    id: str
+    aut_description: str
+    started_at: str
+    has_report: bool
+
+
+@app.get("/api/sessions", response_model=list[SessionSummary])
+async def get_sessions(
+    limit: int = 50,
+    _: None = Depends(_check_api_key),
+) -> list[SessionSummary]:
+    """List up to `limit` sessions, newest first. `has_report` is True when
+    the session completed and a FinalReport was persisted for it."""
+    rows = await asyncio.to_thread(list_sessions, limit)
+    return [SessionSummary(**r) for r in rows]
+
+
+# ==========================================================================
+# DELETE /api/sessions/{session_id} — delete a session and all its data
+# ==========================================================================
+@app.delete("/api/sessions/{session_id}")
+async def delete_session_endpoint(
+    session_id: str,
+    _: None = Depends(_check_api_key),
+) -> Dict[str, Any]:
+    """Delete a session and all its rounds + final_report (CASCADE).
+    Returns 404 if the session_id doesn't exist.
+    """
+    deleted = await asyncio.to_thread(delete_session, session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"No session found with id={session_id!r}")
+    return {"deleted": True, "session_id": session_id}
+
+
+# ==========================================================================
+# POST /api/sessions/{session_id}/rejudge
+# Re-score all existing rounds without re-running the AUT.
+# ==========================================================================
+@app.post("/api/sessions/{session_id}/report", response_model=FinalReport)
+async def rejudge_session(
+    session_id: str,
+    _: None = Depends(_check_api_key),
+) -> FinalReport:
+    """Re-run the Judge over every round in a session that already has
+    task+output recorded, then rebuild and persist the FinalReport.
+    Useful after tweaking PASS_THRESHOLD or the Judge's prompt without
+    needing to re-call the AUT. Returns the rebuilt FinalReport.
+    """
+    rows = await asyncio.to_thread(get_rounds_for_session, session_id)
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No rounds found for session_id={session_id!r} (session may not exist or has no scored rounds).",
+        )
+
+    async def _rejudge() -> FinalReport:
+        for row in rows:
+            task = row.get("task") or ""
+            output = row.get("output") or ""
+            category = row.get("category", "functionality")
+            round_id = row["id"]
+            if not task.strip():
+                continue  # skip rounds with no recorded task (shouldn't happen in practice)
+            score = judge_round(task=task, output=output, category=category)
+            update_round_scores(
+                round_id=round_id,
+                primary_scores={
+                    "task_completion": score.task_completion,
+                    "security": score.security,
+                    "compliance": score.compliance,
+                },
+                secondary_scores={
+                    "accuracy": score.accuracy,
+                    "relevance": score.relevance,
+                    "hallucination": score.hallucination,
+                    "safety": score.safety,
+                },
+                reasoning=score.reasoning,
+                pass_fail=score.passed,
+            )
+        # Rebuild and re-persist the FinalReport from the freshly updated rows.
+        return build_final_report(session_id)
+
+    try:
+        report = await asyncio.to_thread(_rejudge)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    return report

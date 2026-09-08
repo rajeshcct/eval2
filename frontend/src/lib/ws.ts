@@ -225,3 +225,36 @@ export async function fetchHealth(): Promise<{ status: string; llm_configured: b
   }
   return await res.json();
 }
+
+/** Mirrors backend SessionSummary \u2014 one row from GET /api/sessions. */
+export interface SessionSummary {
+  id: string;
+  aut_description: string;
+  started_at: string;
+  has_report: boolean;
+}
+
+/** GET /api/sessions \u2014 list recent sessions, newest first. */
+export async function fetchSessions(limit = 50): Promise<SessionSummary[]> {
+  const res = await fetch(`${BACKEND_HTTP_URL}/api/sessions?limit=${limit}`);
+  if (!res.ok) throw new Error(`GET /api/sessions failed: HTTP ${res.status}`);
+  return (await res.json()) as SessionSummary[];
+}
+
+/** DELETE /api/sessions/{session_id} \u2014 permanently deletes a session + all rounds. */
+export async function deleteSession(sessionId: string): Promise<void> {
+  const res = await fetch(`${BACKEND_HTTP_URL}/api/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error(`DELETE /api/sessions/${sessionId} failed: HTTP ${res.status}`);
+}
+
+/** POST /api/sessions/{session_id}/report \u2014 re-judge all rounds and rebuild the report. */
+export async function rejudgeSession(sessionId: string): Promise<FinalReport> {
+  const res = await fetch(
+    `${BACKEND_HTTP_URL}/api/sessions/${encodeURIComponent(sessionId)}/report`,
+    { method: "POST" },
+  );
+  if (!res.ok) throw new Error(`POST rejudge for ${sessionId} failed: HTTP ${res.status}`);
+  return (await res.json()) as FinalReport;
+}

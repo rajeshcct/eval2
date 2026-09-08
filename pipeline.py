@@ -25,12 +25,12 @@ can be debugged on its own — which is exactly what tests/test_single_round.py
 does, one category at a time.
 """
 import uuid
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel
 
 from agents.generator import generate_task
-from agents.judge import judge_round
+from agents.judge import judge_round, compute_passed
 from aut.connector import AUTConfig, call_aut
 from db.store import init_db, insert_round, insert_session
 from progress import OnEvent, emit_event
@@ -75,6 +75,8 @@ def run_single_round(
     session_id: Optional[str] = None,
     round_number: int = 1,
     on_event: Optional[OnEvent] = None,
+    pass_threshold: Optional[int] = None,
+    prior_rounds: Optional[List["RoundResult"]] = None,
 ) -> RoundResult:
     """
     Run one full round end to end: Generator -> AUT -> Judge -> db.store.
@@ -134,11 +136,14 @@ def run_single_round(
     )
 
     # 1. Generator -> exactly one test task for this category/difficulty.
+    #    Pass prior_rounds so Round 2+ can probe the specific weakness the
+    #    AUT revealed in earlier rounds rather than generating in isolation.
     try:
         generated = generate_task(
             category=category,
             capability_description=capability_description,
             difficulty=difficulty,
+            prior_rounds=prior_rounds if prior_rounds else None,
         )
     except Exception as e:
         emit_event(on_event, "error", {"stage": "generator", "message": str(e)})
@@ -155,12 +160,18 @@ def run_single_round(
 
     # 3. Judge -> score the (task, output, category) triple. `passed` is
     #    already deterministically recomputed inside judge_round().
+    #    If pass_threshold is supplied, override the computed `passed`
+    #    with the caller's threshold instead of the Judge's default.
     try:
         score = judge_round(
             task=generated.task_text,
             output=aut_response.output,
             category=category,
         )
+        if pass_threshold is not None:
+            score.passed = compute_passed(
+                category, score.task_completion, score.security, score.compliance, threshold=pass_threshold
+            )
     except Exception as e:
         emit_event(on_event, "error", {"stage": "judge", "message": str(e)})
         raise
