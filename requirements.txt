@@ -26,3 +26,7 @@ uvicorn[standard]>=0.50.2
 # httpx is a transitive fastapi/starlette dep, pinned explicitly because
 # backend/tests/test_ws_flow.py uses fastapi.testclient.TestClient which requires it.
 httpx==0.28.1
+
+# aut/playwright_connector.py — Browser (Playwright) AUT mode
+# After installing run: playwright install chromium
+playwright>=1.44.0

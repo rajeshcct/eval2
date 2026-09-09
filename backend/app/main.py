@@ -26,9 +26,11 @@ from agents.judge import judge_round, compute_passed
 from aut.auth import (
     ConnectionRequest,
     build_authenticated_endpoint_config,
+    build_browser_config,
     build_custom_endpoint_config,
     build_public_api_config,
     build_socketio_endpoint_config,
+    build_swagger_endpoint_config,
 )
 from aut.connector import call_aut
 from config.llm_config import is_configured
@@ -223,6 +225,29 @@ async def ws_run(websocket: WebSocket) -> None:
                 aut_config = await asyncio.to_thread(
                     build_custom_endpoint_config, start_request.connection
                 )
+            elif start_request.connection.mode == "swagger":
+                # build_swagger_endpoint_config() fetches + parses the OpenAPI
+                # spec — a real network call, hence to_thread. Any
+                # SwaggerAdapter* error is wrapped in AUTAuthError inside
+                # build_swagger_endpoint_config() and caught below.
+                aut_config = await asyncio.to_thread(
+                    build_swagger_endpoint_config, start_request.connection
+                )
+                # Emit the discovery summary so the UI can show which field
+                # was identified and give the user confidence it worked.
+                on_event({
+                    "type": "swagger_discovery",
+                    "data": {"summary": aut_config.schema_summary},
+                })
+            elif start_request.connection.mode == "browser":
+                # build_browser_config() is pure field-mapping — no network call,
+                # cannot raise AUTAuthError. Any playwright error (missing install,
+                # selector not found, login failure) surfaces during the actual
+                # call_aut() invocations inside run_full_session(), as a
+                # `stage: 'session'` error below — not `stage: 'auth'`.
+                aut_config = await asyncio.to_thread(
+                    build_browser_config, start_request.connection
+                )
             elif start_request.connection.mode == "public_api":
                 # build_public_api_config() is pure field-mapping too — no
                 # network call, cannot raise AUTAuthError. A bad model
@@ -264,9 +289,22 @@ async def ws_run(websocket: WebSocket) -> None:
 
     worker_task = asyncio.create_task(worker())
 
+    # Heartbeat loop: send a lightweight "ping" frame every 30 s so the
+    # browser never idles the WebSocket during long LLM calls (which can
+    # take 30-120 s). Without this, the browser closes the socket with
+    # code 1006 and LiveRunView shows "Connection lost" even though the
+    # backend worker is still running fine.
     try:
         while True:
-            item = await queue.get()
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=30.0)
+            except asyncio.TimeoutError:
+                # No real event in 30 s — send a keepalive ping.
+                try:
+                    await websocket.send_json({"type": "ping"})
+                except Exception:  # noqa: BLE001 — socket already gone
+                    break
+                continue
             if item is _DONE:
                 break
             await websocket.send_json(item)
@@ -280,6 +318,7 @@ async def ws_run(websocket: WebSocket) -> None:
         if not worker_task.done():
             await worker_task
         await _safe_close(websocket)
+
 
 
 async def _send_error_and_close(websocket: WebSocket, stage: str, message: str) -> None:

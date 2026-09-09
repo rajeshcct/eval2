@@ -131,13 +131,114 @@ export function defaultPublicAPIConnectionRequest(): PublicAPIConnectionRequest 
   };
 }
 
+/** Mirrors aut/auth.py::SwaggerConnectionRequest exactly. The AUT is an
+ * HTTP endpoint whose request payload format is described by an OpenAPI /
+ * Swagger spec. EvalMind fetches the spec, matches the endpoint, reads the
+ * requestBody schema, and identifies the message field automatically.
+ *
+ * Use this mode when the API has a /openapi.json or /swagger.yaml and its
+ * request body is NOT just {"task": "..."} — e.g. {"message":"...","session_id":"abc"}. */
+export interface SwaggerConnectionRequest {
+  mode: "swagger";
+  /** The actual API endpoint EvalMind POSTs to on every call. */
+  chat_endpoint_url: string;
+  /** URL of the OpenAPI/Swagger spec document (JSON or YAML). */
+  spec_url: string;
+  /** Optional bearer token — sent when fetching the spec AND as the
+   *  Authorization header on every AUT call. */
+  bearer_token: string | null;
+  timeout_seconds: number;
+}
+
+export function defaultSwaggerConnectionRequest(): SwaggerConnectionRequest {
+  return {
+    mode: "swagger",
+    chat_endpoint_url: "",
+    spec_url: "",
+    bearer_token: null,
+    timeout_seconds: 30.0,
+  };
+}
+
+/** Mirrors aut/auth.py::BrowserConnectionRequest exactly. The AUT is a
+ * web chatbot UI driven by a real Playwright-controlled Chromium browser.
+ * EvalMind types the task into the chat input, clicks Send, waits for the
+ * reply, and scrapes the text — no API key or endpoint needed.
+ *
+ * requires_login=false → just the chatbot URL + 3 selectors.
+ * requires_login=true  → also fill in the login URL, selectors, credentials. */
+export interface BrowserConnectionRequest {
+  mode: "browser";
+  /** URL of the chatbot page EvalMind opens in the browser. */
+  chatbot_url: string;
+  /** CSS selector for the text input / textarea. */
+  input_selector: string;
+  /** CSS selector for the Send / Submit button. */
+  send_selector: string;
+  /** CSS selector for the response message element. */
+  response_selector: string;
+  /** How EvalMind knows the response is ready:
+   *  'new_element' — waits for response_selector to appear in DOM,
+   *  'text_change' — polls until response_selector's text changes,
+   *  'fixed_delay'  — waits fixed_delay_seconds then reads. */
+  wait_strategy: "new_element" | "text_change" | "fixed_delay";
+  wait_timeout_seconds: number;
+  fixed_delay_seconds: number;
+  /** Run browser in headless mode (faster, no visible window). */
+  headless: boolean;
+  /** Set true to automate the login sequence before evaluation starts. */
+  requires_login: boolean;
+  login_url: string | null;
+  username_selector: string | null;
+  password_selector: string | null;
+  submit_selector: string | null;
+  username: string | null;
+  password: string | null;
+  /** After clicking submit, wait for the URL to contain this string. */
+  login_success_url_contains: string | null;
+  /** After clicking submit, wait for this CSS selector to appear. */
+  login_success_selector: string | null;
+  /** Selector for a floating/launcher button that must be clicked to open
+   * the chat widget before typing (e.g. a floating "Open Assistant" icon
+   * that mounts the real chat modal only once clicked). Leave null if the
+   * chat input is already visible on page load. */
+  chat_launcher_selector: string | null;
+}
+
+export function defaultBrowserConnectionRequest(): BrowserConnectionRequest {
+  return {
+    mode: "browser",
+    chatbot_url: "",
+    input_selector: "",    // blank = auto-detect
+    send_selector: "",     // blank = auto-detect
+    response_selector: "", // blank = auto-detect
+    wait_strategy: "text_change",
+    wait_timeout_seconds: 60.0,
+    fixed_delay_seconds: 5.0,
+    headless: true,
+    requires_login: false,
+    login_url: null,
+    username_selector: null,
+    password_selector: null,
+    submit_selector: null,
+    username: null,
+    password: null,
+    login_success_url_contains: null,
+    login_success_selector: null,
+    chat_launcher_selector: null,
+  };
+}
+
 /** Mirrors aut/auth.py::ConnectionRequest — a discriminated union (on
- * `mode`) of all four connection types. */
+ * `mode`) of all six connection types. */
 export type ConnectionRequest =
   | AUTConnectionRequest
   | SocketIOConnectionRequest
   | CustomEndpointConnectionRequest
-  | PublicAPIConnectionRequest;
+  | PublicAPIConnectionRequest
+  | SwaggerConnectionRequest
+  | BrowserConnectionRequest;
+
 
 /** Mirrors backend/app/main.py::SessionStartRequest exactly — the one JSON
  * message a /ws/run client sends immediately after the WebSocket connects.

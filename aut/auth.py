@@ -22,7 +22,7 @@ import requests
 from pydantic import BaseModel, Field
 from typing_extensions import Annotated
 
-from aut.connector import CustomEndpointConfig, PublicAPIConfig, SocketIOEndpointConfig
+from aut.connector import BrowserConfig, CustomEndpointConfig, PublicAPIConfig, SocketIOEndpointConfig, SwaggerEndpointConfig
 
 
 class AUTAuthError(RuntimeError):
@@ -249,18 +249,160 @@ def build_public_api_config(connection: PublicAPIConnectionRequest) -> PublicAPI
     return PublicAPIConfig(**kwargs)
 
 
+class SwaggerConnectionRequest(BaseModel):
+    """Mode 'swagger' — the AUT is an HTTP endpoint whose request payload
+    format is described by an OpenAPI/Swagger spec. EvalMind fetches the spec,
+    matches the endpoint URL to a path, reads the requestBody schema, and
+    identifies which field carries the user's chat message automatically.
+
+    This is the right mode when:
+      - The AUT is a documented REST API (has a /openapi.json or /swagger.yaml)
+      - Its request body is NOT the simple {"task": "..."} that direct_http
+        expects — it might need {"message": "...", "session_id": "abc"} or
+        any other custom shape the spec describes.
+
+    Fields:
+      chat_endpoint_url: the actual API endpoint to POST to on every call.
+      spec_url:          URL of the OpenAPI/Swagger spec document.
+      bearer_token:      optional JWT/API key — used both to fetch the spec
+                         (if it's access-controlled) and as the Authorization
+                         header on every subsequent AUT call.
+      timeout_seconds:   per-call HTTP timeout (default 30s).
+    """
+
+    mode: Literal["swagger"] = "swagger"
+    chat_endpoint_url: str
+    spec_url: str
+    bearer_token: Optional[str] = None
+    timeout_seconds: float = 30.0
+
+
+def build_swagger_endpoint_config(
+    connection: SwaggerConnectionRequest,
+) -> SwaggerEndpointConfig:
+    """Run Swagger auto-discovery and return a SwaggerEndpointConfig ready
+    to pass into call_aut() for every round/Describer probe.
+
+    This DOES make a network call (fetching the OpenAPI spec), so it must
+    be run in a thread (asyncio.to_thread) just like build_authenticated_
+    endpoint_config(). Any SwaggerAdapter* error propagates out as an
+    AUTAuthError so main.py's existing `stage: 'auth'` error path handles it.
+
+    Raises:
+        AUTAuthError: wraps any SwaggerFetchError / SwaggerMatchError /
+                      SwaggerSchemaError / SwaggerFieldError with a clear
+                      user-facing message.
+    """
+    from aut.swagger_adapter import (
+        discover_swagger_config,
+        SwaggerAdapterError,
+    )
+
+    try:
+        result = discover_swagger_config(
+            endpoint_url=connection.chat_endpoint_url,
+            spec_url=connection.spec_url,
+            bearer_token=connection.bearer_token,
+        )
+    except SwaggerAdapterError as e:
+        raise AUTAuthError(
+            f"Swagger auto-discovery failed for '{connection.chat_endpoint_url}': {e}"
+        ) from e
+
+    return SwaggerEndpointConfig(
+        url=connection.chat_endpoint_url,
+        message_field=result.message_field,
+        static_fields=result.static_fields,
+        headers=result.extra_headers or None,
+        timeout_seconds=connection.timeout_seconds,
+        schema_summary=result.schema_summary,
+    )
+
+
+class BrowserConnectionRequest(BaseModel):
+    """Mode 'browser' — the AUT is a web chatbot UI driven by a real
+    Playwright-controlled Chromium browser. EvalMind types the task into
+    the chat input, clicks Send, waits for the reply, and scrapes the text.
+
+    No API key or endpoint needed — just the page URL and CSS selectors
+    for the input box, send button, and response area.
+
+    Optional login: set requires_login=True and provide the login URL,
+    selectors, and credentials. Login happens once at session start; all
+    subsequent rounds reuse the saved browser session (cookies stay intact).
+    """
+
+    mode: Literal["browser"] = "browser"
+
+    # Chatbot page
+    chatbot_url: str
+    input_selector: str = "textarea"         # CSS selector for the chat input
+    send_selector: str = "button[type=submit]"  # CSS selector for Send button
+    response_selector: str = ".message:last-child"  # CSS selector for response
+
+    # Response detection
+    wait_strategy: str = "text_change"   # 'new_element' | 'text_change' | 'fixed_delay'
+    wait_timeout_seconds: float = 60.0
+    fixed_delay_seconds: float = 5.0
+
+    # Browser
+    headless: bool = True
+
+    # Optional login
+    requires_login: bool = False
+    login_url: Optional[str] = None
+    username_selector: Optional[str] = None
+    password_selector: Optional[str] = None
+    submit_selector: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    login_success_url_contains: Optional[str] = None
+    login_success_selector: Optional[str] = None
+
+    # Optional — selector for a floating/launcher button that must be
+    # clicked to open the chat widget before typing (see BrowserConfig's
+    # own docstring in aut/connector.py). Leave blank if the chat input is
+    # already visible on page load.
+    chat_launcher_selector: Optional[str] = None
+
+
+def build_browser_config(connection: BrowserConnectionRequest) -> BrowserConfig:
+    """Pure field-mapping — no network call. Translates a BrowserConnectionRequest
+    (from the frontend form) into a BrowserConfig ready for call_aut().
+    Any missing-playwright error surfaces later during the actual call, as a
+    `stage: 'session'` error — same pattern as build_public_api_config()."""
+    return BrowserConfig(
+        chatbot_url=connection.chatbot_url,
+        input_selector=connection.input_selector,
+        send_selector=connection.send_selector,
+        response_selector=connection.response_selector,
+        wait_strategy=connection.wait_strategy,
+        wait_timeout_seconds=connection.wait_timeout_seconds,
+        fixed_delay_seconds=connection.fixed_delay_seconds,
+        headless=connection.headless,
+        requires_login=connection.requires_login,
+        login_url=connection.login_url,
+        username_selector=connection.username_selector,
+        password_selector=connection.password_selector,
+        submit_selector=connection.submit_selector,
+        username=connection.username,
+        password=connection.password,
+        login_success_url_contains=connection.login_success_url_contains,
+        login_success_selector=connection.login_success_selector,
+        chat_launcher_selector=connection.chat_launcher_selector,
+    )
+
+
 # Discriminated union of every supported connection-request type, keyed on
 # `mode` — the same pattern aut/connector.py already uses for AUTConfig.
-# SessionStartRequest.connection (backend/app/main.py) is typed as this
-# union so a single /ws/run request can carry an HTTP/login-gated
-# connection, a Socket.IO one, a direct no-auth HTTP one, or a direct
-# public-API (AUT-is-an-LLM) one.
 ConnectionRequest = Annotated[
     Union[
         AUTConnectionRequest,
         SocketIOConnectionRequest,
         CustomEndpointConnectionRequest,
         PublicAPIConnectionRequest,
+        SwaggerConnectionRequest,
+        BrowserConnectionRequest,
     ],
     Field(discriminator="mode"),
 ]

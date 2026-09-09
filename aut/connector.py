@@ -201,6 +201,91 @@ class ManualConfig(BaseModel):
     json_path: str
 
 
+class SwaggerEndpointConfig(BaseModel):
+    """Mode 'swagger_endpoint' — the AUT is an HTTP service whose request
+    payload was auto-discovered from an OpenAPI/Swagger spec by
+    aut/swagger_adapter.py's discover_swagger_config().
+
+    This config is NOT built directly by the user — it is always produced
+    by build_swagger_endpoint_config() in aut/auth.py after a successful
+    Swagger discovery pass. The caller never needs to know the payload shape;
+    they just call call_aut(task, config) and the correct JSON body is
+    assembled automatically.
+
+    Fields:
+      url:           the API endpoint URL to POST to.
+      message_field: the request body field that carries the user's message.
+      static_fields: all other required fields with their default/zero values.
+      headers:       HTTP headers (e.g. Authorization) to send on every call.
+      timeout_seconds: per-call HTTP timeout.
+      schema_summary:  human-readable one-line description of the discovered
+                       schema (logged and forwarded to the UI as discovery info).
+    """
+
+    mode: Literal["swagger_endpoint"] = "swagger_endpoint"
+    url: str
+    message_field: str
+    static_fields: dict[str, Any] = Field(default_factory=dict)
+    headers: Optional[dict[str, str]] = None
+    timeout_seconds: float = 30.0
+    schema_summary: str = ""
+
+
+class BrowserConfig(BaseModel):
+    """Mode 'browser' — the AUT is a web chatbot UI, driven by a real
+    Playwright-controlled Chromium browser. EvalMind types the task into the
+    chat input, clicks Send, waits for the response, and scrapes the text.
+
+    NOT built directly by users — produced by build_browser_config() in
+    aut/auth.py from a BrowserConnectionRequest submitted by the form.
+
+    Login fields (all optional, only used when requires_login=True):
+      login_url, username_selector, password_selector, submit_selector,
+      username, password, login_success_url_contains / login_success_selector.
+
+    wait_strategy controls how EvalMind knows the bot has finished:
+      'new_element'  — waits for response_selector to appear in the DOM
+      'text_change'  — polls until response_selector's text changes
+      'fixed_delay'  — waits fixed_delay_seconds then reads response_selector
+    """
+
+    mode: Literal["browser"] = "browser"
+
+    # Chatbot page
+    chatbot_url: str
+    input_selector: str       # CSS selector for the text input / textarea
+    send_selector: str        # CSS selector for the Send / Submit button
+    response_selector: str    # CSS selector for the last / latest response message
+
+    # Response detection
+    wait_strategy: str = "text_change"  # 'new_element' | 'text_change' | 'fixed_delay'
+    wait_timeout_seconds: float = 60.0
+    fixed_delay_seconds: float = 5.0    # only used when wait_strategy='fixed_delay'
+
+    # Browser
+    headless: bool = True
+
+    # Optional login
+    requires_login: bool = False
+    login_url: Optional[str] = None
+    username_selector: Optional[str] = None
+    password_selector: Optional[str] = None
+    submit_selector: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    login_success_url_contains: Optional[str] = None  # e.g. "/dashboard"
+    login_success_selector: Optional[str] = None      # e.g. "#chat-container"
+
+    # Optional chat launcher — some chat UIs are a floating "Open
+    # Assistant" button that must be clicked before the input/send/response
+    # elements even exist in the DOM (a modal/panel that isn't mounted
+    # until opened). If set, this selector is clicked once per page load,
+    # right after navigating to chatbot_url and before any input/send/
+    # response detection or interaction happens. Leave blank if the chat
+    # UI is already visible/open on page load.
+    chat_launcher_selector: Optional[str] = None
+
+
 AUTConfig = Annotated[
     Union[
         PublicAPIConfig,
@@ -208,6 +293,8 @@ AUTConfig = Annotated[
         SocketIOEndpointConfig,
         FunctionImportConfig,
         ManualConfig,
+        SwaggerEndpointConfig,
+        BrowserConfig,
     ],
     Field(discriminator="mode"),
 ]
@@ -645,6 +732,70 @@ def _call_manual(task: str, config: ManualConfig) -> AUTResponse:
     )
 
 
+def _call_swagger_endpoint(task: str, config: SwaggerEndpointConfig) -> AUTResponse:
+    """POST to a Swagger-discovered endpoint using the auto-built payload.
+
+    Identical to _call_custom_endpoint in its HTTP handling — the only
+    difference is that the request body is assembled by the discovered
+    message_field + static_fields instead of a hardcoded {task_field: task}.
+    """
+    payload = {config.message_field: task, **config.static_fields}
+
+    start = time.perf_counter()
+    try:
+        http_response = requests.post(
+            config.url,
+            json=payload,
+            headers=config.headers,
+            timeout=config.timeout_seconds,
+        )
+    except requests.RequestException as e:
+        raise AUTConnectorError(
+            f"swagger_endpoint request to '{config.url}' failed: {e}"
+        ) from e
+    latency_ms = (time.perf_counter() - start) * 1000
+
+    if not http_response.ok:
+        raise AUTConnectorError(
+            f"swagger_endpoint '{config.url}' returned HTTP "
+            f"{http_response.status_code}: {http_response.text[:500]!r}"
+        )
+
+    try:
+        body = http_response.json()
+    except ValueError:
+        # Plain-text response — accept it directly.
+        if http_response.text.strip():
+            return AUTResponse(
+                output=http_response.text.strip(),
+                latency_ms=latency_ms,
+                tokens_used=None,
+                estimated_cost=None,
+            )
+        raise AUTConnectorError(
+            f"swagger_endpoint '{config.url}' returned an empty body."
+        )
+
+    output = _extract_output_text(body)
+    tokens_used = body.get("tokens_used") if isinstance(body, dict) else None
+    estimated_cost = body.get("estimated_cost") if isinstance(body, dict) else None
+
+    return AUTResponse(
+        output=output,
+        latency_ms=latency_ms,
+        tokens_used=tokens_used,
+        estimated_cost=estimated_cost,
+    )
+
+
+def _call_browser(task: str, config: BrowserConfig) -> AUTResponse:
+    """Drive a real browser to interact with the chatbot web UI.
+    Delegates entirely to aut/playwright_connector.py so playwright's import
+    stays isolated from the rest of the connector layer."""
+    from aut.playwright_connector import call_browser_aut  # local import — keeps playwright optional
+    return call_browser_aut(task, config)
+
+
 # ==========================================================================
 # Public entry point
 # ==========================================================================
@@ -654,6 +805,8 @@ _DISPATCH: dict[str, Callable[[str, Any], AUTResponse]] = {
     "socketio_endpoint": _call_socketio_endpoint,
     "function_import": _call_function_import,
     "manual": _call_manual,
+    "swagger_endpoint": _call_swagger_endpoint,
+    "browser": _call_browser,
 }
 
 

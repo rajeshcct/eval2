@@ -2,17 +2,21 @@ import { useState } from "react";
 import SessionHistoryPanel from "./SessionHistoryPanel";
 import type {
   AUTConnectionRequest,
+  BrowserConnectionRequest,
   ConnectionRequest,
   CustomEndpointConnectionRequest,
   PublicAPIConnectionRequest,
   SessionStartRequest,
   SocketIOConnectionRequest,
+  SwaggerConnectionRequest,
 } from "../lib/types";
 import {
   defaultAUTConnectionRequest,
+  defaultBrowserConnectionRequest,
   defaultCustomEndpointConnectionRequest,
   defaultPublicAPIConnectionRequest,
   defaultSocketIOConnectionRequest,
+  defaultSwaggerConnectionRequest,
 } from "../lib/types";
 
 interface NewSessionFormProps {
@@ -51,7 +55,7 @@ interface NewSessionFormProps {
  * landing page without needing to hand-edit a URL.
  */
 export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewSessionFormProps) {
-  const [connectionMode, setConnectionMode] = useState<"http" | "socketio" | "direct_http" | "public_api">(
+  const [connectionMode, setConnectionMode] = useState<"http" | "socketio" | "direct_http" | "public_api" | "swagger" | "browser">(
     "http",
   );
   const [connection, setConnection] = useState<AUTConnectionRequest>(defaultAUTConnectionRequest());
@@ -64,6 +68,14 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
   const [publicApiConnection, setPublicApiConnection] = useState<PublicAPIConnectionRequest>(
     defaultPublicAPIConnectionRequest(),
   );
+  const [swaggerConnection, setSwaggerConnection] = useState<SwaggerConnectionRequest>(
+    defaultSwaggerConnectionRequest(),
+  );
+  const [swaggerShowToken, setSwaggerShowToken] = useState(false);
+  const [browserConnection, setBrowserConnection] = useState<BrowserConnectionRequest>(
+    defaultBrowserConnectionRequest(),
+  );
+  const [browserShowPassword, setBrowserShowPassword] = useState(false);
   const [maxRounds, setMaxRounds] = useState<number>(5);
   const [capabilityOverride, setCapabilityOverride] = useState<string>("");
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -109,6 +121,20 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
     setPublicApiConnection((prev) => ({ ...prev, [key]: value }));
   }
 
+  function updateSwaggerConnection<K extends keyof SwaggerConnectionRequest>(
+    key: K,
+    value: SwaggerConnectionRequest[K],
+  ) {
+    setSwaggerConnection((prev) => ({ ...prev, [key]: value }));
+  }
+
+  function updateBrowserConnection<K extends keyof BrowserConnectionRequest>(
+    key: K,
+    value: BrowserConnectionRequest[K],
+  ) {
+    setBrowserConnection((prev) => ({ ...prev, [key]: value }));
+  }
+
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setFormError(null);
@@ -151,6 +177,33 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
         return;
       }
       activeConnection = publicApiConnection;
+    } else if (connectionMode === "swagger") {
+      if (!swaggerConnection.chat_endpoint_url.trim()) {
+        setFormError("Chat endpoint URL is required.");
+        return;
+      }
+      if (!swaggerConnection.spec_url.trim()) {
+        setFormError("OpenAPI spec URL is required.");
+        return;
+      }
+      activeConnection = swaggerConnection;
+    } else if (connectionMode === "browser") {
+      if (!browserConnection.chatbot_url.trim()) {
+        setFormError("Chatbot page URL is required.");
+        return;
+      }
+      // Selectors are optional — blank = auto-detect at runtime
+      if (browserConnection.requires_login) {
+        if (!browserConnection.login_url?.trim()) {
+          setFormError("Login URL is required when login is enabled.");
+          return;
+        }
+        if (!browserConnection.username?.trim() || !browserConnection.password) {
+          setFormError("Username and password are required when login is enabled.");
+          return;
+        }
+      }
+      activeConnection = browserConnection;
     } else {
       if (!socketioConnection.chat_endpoint_url.trim()) {
         setFormError("Chat endpoint URL is required.");
@@ -205,7 +258,7 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
 
         <div className="flex flex-col gap-2">
           <span className="text-sm font-medium text-slate-200">Connection type</span>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
             <button
               type="button"
               onClick={() => setConnectionMode("http")}
@@ -253,6 +306,30 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
               }`}
             >
               Public API (LLM)
+            </button>
+            <button
+              type="button"
+              onClick={() => setConnectionMode("swagger")}
+              aria-pressed={connectionMode === "swagger"}
+              className={`flex-1 rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
+                connectionMode === "swagger"
+                  ? "border-violet-500 bg-violet-600/20 text-violet-200"
+                  : "border-slate-700 bg-slate-900 text-slate-300 hover:bg-slate-800"
+              }`}
+            >
+              Swagger / OpenAPI
+            </button>
+            <button
+              type="button"
+              onClick={() => setConnectionMode("browser")}
+              aria-pressed={connectionMode === "browser"}
+              className={`flex-1 rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
+                connectionMode === "browser"
+                  ? "border-emerald-500 bg-emerald-600/20 text-emerald-200"
+                  : "border-slate-700 bg-slate-900 text-slate-300 hover:bg-slate-800"
+              }`}
+            >
+              Browser (Playwright)
             </button>
           </div>
         </div>
@@ -435,6 +512,386 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
                 className="w-32 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
               />
             </div>
+          </>
+        )}
+
+        {connectionMode === "swagger" && (
+          <>
+            {/* Info callout */}
+            <div className="rounded-md border border-violet-800 bg-violet-950/40 px-4 py-3 text-sm text-violet-300">
+              <p className="font-medium text-violet-200 mb-1">🔍 Swagger / OpenAPI Auto-Discovery</p>
+              <p>
+                EvalMind will fetch your spec, find the matching endpoint, read its request body
+                schema, and automatically identify which field carries the chat message.
+                No manual payload mapping needed.
+              </p>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <label htmlFor="swagger_endpoint_url" className="text-sm font-medium text-slate-200">
+                Chat endpoint URL
+              </label>
+              <input
+                id="swagger_endpoint_url"
+                type="text"
+                required
+                placeholder="https://api.example.com/v1/chat"
+                value={swaggerConnection.chat_endpoint_url}
+                onChange={(e) => updateSwaggerConnection("chat_endpoint_url", e.target.value)}
+                className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
+              />
+              <p className="text-xs text-slate-500">
+                The actual endpoint EvalMind will POST to on every evaluation call.
+              </p>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <label htmlFor="swagger_spec_url" className="text-sm font-medium text-slate-200">
+                OpenAPI / Swagger spec URL
+              </label>
+              <input
+                id="swagger_spec_url"
+                type="text"
+                required
+                placeholder="https://api.example.com/openapi.json"
+                value={swaggerConnection.spec_url}
+                onChange={(e) => updateSwaggerConnection("spec_url", e.target.value)}
+                className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
+              />
+              <p className="text-xs text-slate-500">
+                URL of the spec document (JSON or YAML). Try{" "}
+                <code className="text-slate-400">/openapi.json</code>,{" "}
+                <code className="text-slate-400">/swagger.json</code>, or{" "}
+                <code className="text-slate-400">/api-docs</code>.
+              </p>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center justify-between">
+                <label htmlFor="swagger_bearer_token" className="text-sm font-medium text-slate-200">
+                  Bearer token <span className="text-slate-500">(optional)</span>
+                </label>
+                <button
+                  type="button"
+                  onClick={() => setSwaggerShowToken((v) => !v)}
+                  className="text-xs text-slate-500 hover:text-slate-300 transition-colors"
+                >
+                  {swaggerShowToken ? "Hide" : "Show"}
+                </button>
+              </div>
+              <input
+                id="swagger_bearer_token"
+                type={swaggerShowToken ? "text" : "password"}
+                placeholder="eyJ… (optional — used for spec fetch + every AUT call)"
+                value={swaggerConnection.bearer_token ?? ""}
+                onChange={(e) =>
+                  updateSwaggerConnection(
+                    "bearer_token",
+                    e.target.value.trim() ? e.target.value.trim() : null,
+                  )
+                }
+                className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-500 placeholder:font-sans focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
+              />
+              <p className="text-xs text-slate-500">
+                Sent as <code className="text-slate-400">Authorization: Bearer …</code> when
+                fetching the spec and on every evaluation call. Leave blank for public APIs.
+              </p>
+            </div>
+          </>
+        )}
+
+        {connectionMode === "browser" && (
+          <>
+            {/* Info callout */}
+            <div className="rounded-md border border-emerald-800 bg-emerald-950/40 px-4 py-3 text-sm text-emerald-300">
+              <p className="font-medium text-emerald-200 mb-1">🌐 Browser (Playwright) Mode</p>
+              <p>
+                EvalMind opens a real Chromium browser, types the task into the chat input,
+                clicks Send, waits for the reply, and scrapes the response — no API needed.
+              </p>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <label htmlFor="browser_chatbot_url" className="text-sm font-medium text-slate-200">
+                Chatbot page URL
+              </label>
+              <input
+                id="browser_chatbot_url"
+                type="text"
+                required
+                placeholder="https://answers.reddit.com"
+                value={browserConnection.chatbot_url}
+                onChange={(e) => updateBrowserConnection("chatbot_url", e.target.value)}
+                className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+              />
+            </div>
+
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+              <div className="flex flex-col gap-2">
+                <label htmlFor="browser_input_selector" className="text-sm font-medium text-slate-200">
+                  Input selector <span className="text-slate-500">(optional)</span>
+                </label>
+                <input
+                  id="browser_input_selector"
+                  type="text"
+                  placeholder="Auto-detect or: textarea"
+                  value={browserConnection.input_selector}
+                  onChange={(e) => updateBrowserConnection("input_selector", e.target.value)}
+                  className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-sm text-slate-100 placeholder:text-slate-500 placeholder:font-sans focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                />
+                <p className="text-xs text-slate-500">Leave blank to auto-detect</p>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <label htmlFor="browser_send_selector" className="text-sm font-medium text-slate-200">
+                  Send button selector <span className="text-slate-500">(optional)</span>
+                </label>
+                <input
+                  id="browser_send_selector"
+                  type="text"
+                  placeholder="Auto-detect or: button[type=submit]"
+                  value={browserConnection.send_selector}
+                  onChange={(e) => updateBrowserConnection("send_selector", e.target.value)}
+                  className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-sm text-slate-100 placeholder:text-slate-500 placeholder:font-sans focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                />
+                <p className="text-xs text-slate-500">Leave blank to auto-detect</p>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <label htmlFor="browser_response_selector" className="text-sm font-medium text-slate-200">
+                  Response selector <span className="text-slate-500">(optional)</span>
+                </label>
+                <input
+                  id="browser_response_selector"
+                  type="text"
+                  placeholder="Auto-detect or: .message:last-child"
+                  value={browserConnection.response_selector}
+                  onChange={(e) => updateBrowserConnection("response_selector", e.target.value)}
+                  className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-sm text-slate-100 placeholder:text-slate-500 placeholder:font-sans focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                />
+                <p className="text-xs text-slate-500">Leave blank to auto-detect</p>
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <label htmlFor="browser_chat_launcher_selector" className="text-sm font-medium text-slate-200">
+                Chat launcher button selector <span className="text-slate-500">(optional)</span>
+              </label>
+              <input
+                id="browser_chat_launcher_selector"
+                type="text"
+                placeholder="e.g. button[aria-label='Open AI Assistant'] or .ai-assistant-btn"
+                value={browserConnection.chat_launcher_selector ?? ""}
+                onChange={(e) =>
+                  updateBrowserConnection("chat_launcher_selector", e.target.value.trim() || null)
+                }
+                className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-sm text-slate-100 placeholder:text-slate-500 placeholder:font-sans focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+              />
+              <p className="text-xs text-slate-500">
+                If the chat opens in a popup/modal triggered by a floating button (not already visible
+                on page load), give its selector here — EvalMind clicks it once before looking for the
+                input box. Leave blank if the chat is already open by default.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div className="flex flex-col gap-2">
+                <label htmlFor="browser_wait_strategy" className="text-sm font-medium text-slate-200">
+                  Wait strategy
+                </label>
+                <select
+                  id="browser_wait_strategy"
+                  value={browserConnection.wait_strategy}
+                  onChange={(e) =>
+                    updateBrowserConnection(
+                      "wait_strategy",
+                      e.target.value as "new_element" | "text_change" | "fixed_delay",
+                    )
+                  }
+                  className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                >
+                  <option value="text_change">text_change — poll until text changes</option>
+                  <option value="new_element">new_element — wait for element to appear</option>
+                  <option value="fixed_delay">fixed_delay — wait N seconds then read</option>
+                </select>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <label htmlFor="browser_wait_timeout" className="text-sm font-medium text-slate-200">
+                  Response timeout (s)
+                </label>
+                <input
+                  id="browser_wait_timeout"
+                  type="number"
+                  min={5}
+                  max={300}
+                  value={browserConnection.wait_timeout_seconds}
+                  onChange={(e) =>
+                    updateBrowserConnection("wait_timeout_seconds", Number(e.target.value))
+                  }
+                  className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between rounded-md border border-slate-800 bg-slate-900/50 px-3 py-2">
+              <label htmlFor="browser_headless" className="text-sm font-medium text-slate-200">
+                Run browser in headless mode
+              </label>
+              <input
+                id="browser_headless"
+                type="checkbox"
+                checked={browserConnection.headless}
+                onChange={(e) => updateBrowserConnection("headless", e.target.checked)}
+                className="h-4 w-4 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500"
+              />
+            </div>
+
+            {/* Login toggle */}
+            <div className="flex items-center justify-between rounded-md border border-slate-800 bg-slate-900/50 px-3 py-2">
+              <label htmlFor="browser_requires_login" className="text-sm font-medium text-slate-200">
+                This chatbot requires login
+              </label>
+              <input
+                id="browser_requires_login"
+                type="checkbox"
+                checked={browserConnection.requires_login}
+                onChange={(e) => updateBrowserConnection("requires_login", e.target.checked)}
+                className="h-4 w-4 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500"
+              />
+            </div>
+
+            {browserConnection.requires_login && (
+              <div className="flex flex-col gap-4 rounded-md border border-emerald-900 bg-emerald-950/20 p-4">
+                <div className="flex flex-col gap-2">
+                  <label htmlFor="browser_login_url" className="text-sm font-medium text-slate-200">
+                    Login page URL
+                  </label>
+                  <input
+                    id="browser_login_url"
+                    type="text"
+                    placeholder="https://reddit.com/login"
+                    value={browserConnection.login_url ?? ""}
+                    onChange={(e) =>
+                      updateBrowserConnection("login_url", e.target.value.trim() || null)
+                    }
+                    className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                  />
+                </div>
+
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="flex flex-col gap-2">
+                    <label htmlFor="browser_username_sel" className="text-sm font-medium text-slate-200">
+                      Username selector <span className="text-slate-500">(optional)</span>
+                    </label>
+                    <input
+                      id="browser_username_sel"
+                      type="text"
+                      placeholder="Auto-detect or: input[name='username']"
+                      value={browserConnection.username_selector ?? ""}
+                      onChange={(e) =>
+                        updateBrowserConnection("username_selector", e.target.value.trim() || null)
+                      }
+                      className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-500 placeholder:font-sans focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
+                    <p className="text-xs text-slate-500">Leave blank to auto-detect</p>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <label htmlFor="browser_password_sel" className="text-sm font-medium text-slate-200">
+                      Password selector <span className="text-slate-500">(optional)</span>
+                    </label>
+                    <input
+                      id="browser_password_sel"
+                      type="text"
+                      placeholder="Auto-detect or: input[type='password']"
+                      value={browserConnection.password_selector ?? ""}
+                      onChange={(e) =>
+                        updateBrowserConnection("password_selector", e.target.value.trim() || null)
+                      }
+                      className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-500 placeholder:font-sans focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
+                    <p className="text-xs text-slate-500">Leave blank to auto-detect</p>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <label htmlFor="browser_submit_sel" className="text-sm font-medium text-slate-200">
+                      Submit selector <span className="text-slate-500">(optional)</span>
+                    </label>
+                    <input
+                      id="browser_submit_sel"
+                      type="text"
+                      placeholder="Auto-detect or: button[type='submit']"
+                      value={browserConnection.submit_selector ?? ""}
+                      onChange={(e) =>
+                        updateBrowserConnection("submit_selector", e.target.value.trim() || null)
+                      }
+                      className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-500 placeholder:font-sans focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
+                    <p className="text-xs text-slate-500">Leave blank to auto-detect</p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="flex flex-col gap-2">
+                    <label htmlFor="browser_username" className="text-sm font-medium text-slate-200">
+                      Username
+                    </label>
+                    <input
+                      id="browser_username"
+                      type="text"
+                      autoComplete="off"
+                      value={browserConnection.username ?? ""}
+                      onChange={(e) =>
+                        updateBrowserConnection("username", e.target.value || null)
+                      }
+                      className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-center justify-between">
+                      <label htmlFor="browser_password" className="text-sm font-medium text-slate-200">
+                        Password
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => setBrowserShowPassword((v) => !v)}
+                        className="text-xs text-slate-500 hover:text-slate-300 transition-colors"
+                      >
+                        {browserShowPassword ? "Hide" : "Show"}
+                      </button>
+                    </div>
+                    <input
+                      id="browser_password"
+                      type={browserShowPassword ? "text" : "password"}
+                      autoComplete="new-password"
+                      value={browserConnection.password ?? ""}
+                      onChange={(e) =>
+                        updateBrowserConnection("password", e.target.value || null)
+                      }
+                      className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex flex-col gap-2">
+                  <label htmlFor="browser_login_success" className="text-sm font-medium text-slate-200">
+                    Wait for URL to contain <span className="text-slate-500">(after login)</span>
+                  </label>
+                  <input
+                    id="browser_login_success"
+                    type="text"
+                    placeholder="/dashboard  or  /home  (leave blank to wait 2s)"
+                    value={browserConnection.login_success_url_contains ?? ""}
+                    onChange={(e) =>
+                      updateBrowserConnection(
+                        "login_success_url_contains",
+                        e.target.value.trim() || null,
+                      )
+                    }
+                    className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                  />
+                </div>
+              </div>
+            )}
           </>
         )}
 

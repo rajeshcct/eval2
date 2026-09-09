@@ -111,6 +111,10 @@ export default function App() {
   }, []);
 
   const handleEvent = useCallback((event: ProgressEvent) => {
+    // Silently drop keepalive pings sent by the backend every 30 s to
+    // prevent browser WebSocket idle-timeout during long LLM calls.
+    if ((event as { type: string }).type === "ping") return;
+
     // Phase III checkpoint: every incoming event lands in the console,
     // raw, in the order it arrived. Kept even now that LiveRunView renders
     // events properly — still the fastest way to inspect the raw feed.
@@ -138,6 +142,7 @@ export default function App() {
       setState("report");
     }
   }, []);
+
 
   function handleStart(request: SessionStartRequest) {
     setSocketError(null);
