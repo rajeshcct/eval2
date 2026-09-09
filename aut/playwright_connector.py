@@ -277,14 +277,19 @@ Below is the stripped HTML of a chatbot UI at {url}.
 We still need CSS selectors for: {still_missing}
 
 Identify the BEST, MOST UNIQUE CSS selector for each missing element.
-- 'input': The text input or textarea where the user types their message.
-- 'send': The send or submit button to submit the message.
-- 'response': The element containing the bot's chat response (usually the last message in a list). Use :last-child or :last-of-type if it's a list.
+CRITICAL RULES:
+1. The selector MUST perfectly match an element that ACTUALLY EXISTS in the provided HTML.
+2. DO NOT output generic fallback selectors like 'textarea, input'. Look at the HTML and find the actual class, id, or data-testid.
+3. If it's a chat input, look for search bars, text inputs, or textareas that a user would type a message into.
+4. If it's a send button, look for buttons near the input, often with an icon or 'Send' text.
+5. If it's a response, look for the container holding the chatbot's messages. Use :last-child or :last-of-type if it's a list.
+6. If the chat input is hidden behind a 'chat widget' launcher button (e.g. a floating icon), provide its selector as well. If the chat is already open and visible without a launcher, return 'None' for LAUNCHER_SELECTOR.
 
 Respond in EXACTLY this format (one selector per line, no explanation, only for the missing ones):
 INPUT_SELECTOR: <selector>
 SEND_SELECTOR: <selector>
 RESPONSE_SELECTOR: <selector>
+LAUNCHER_SELECTOR: <selector or None>
 
 HTML:
 {clean_html[:30000]}"""
@@ -300,6 +305,10 @@ HTML:
                     detected["send"] = line.split(":", 1)[1].strip()
                 elif line.startswith("RESPONSE_SELECTOR:") and "response" in still_missing:
                     detected["response"] = line.split(":", 1)[1].strip()
+                elif line.startswith("LAUNCHER_SELECTOR:"):
+                    sel = line.split(":", 1)[1].strip()
+                    if sel and sel.lower() not in ["none", "null", ""]:
+                        detected["launcher"] = sel
                     
             still_missing = [k for k in ("input", "send", "response") if k not in detected]
         except Exception as e:
@@ -934,6 +943,20 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
             input_sel = config.input_selector.strip() or detected["input"]
             send_sel = config.send_selector.strip() or detected["send"]
             response_sel = config.response_selector.strip() or detected["response"]
+            
+            # If the LLM fallback noticed a chat launcher was necessary but the user
+            # hadn't explicitly configured one, we dynamically click it here BEFORE
+            # trying to interact with the input (otherwise the input remains hidden!)
+            detected_launcher = detected.get("launcher")
+            if detected_launcher and not config.chat_launcher_selector:
+                try:
+                    llm_launcher_locator = _wait_for_selector_with_frames(
+                        page, detected_launcher, timeout_ms, state="visible"
+                    )
+                    llm_launcher_locator.click()
+                    page.wait_for_timeout(500)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[browser debug] LLM-detected launcher '{detected_launcher}' failed: {e}")
         else:
             input_sel = config.input_selector
             send_sel = config.send_selector
