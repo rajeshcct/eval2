@@ -666,6 +666,15 @@ def _query_in_frames(page: Any, sel: str) -> Any:
     return None
 
 
+def _ensure_visible_sel(sel: str) -> str:
+    """Fix strict-mode/ambiguity timeouts: if a selector matches multiple elements
+    but the first one is hidden, Playwright hangs. We explicitly ask for the
+    first VISIBLE match unless the user already provided complex combinators.
+    """
+    if "visible=" not in sel.lower() and "nth=" not in sel.lower():
+        return f"{sel} >> visible=true >> nth=0"
+    return sel
+
 def _wait_for_selector_with_frames(
     page: Any,
     sel: str,
@@ -674,30 +683,22 @@ def _wait_for_selector_with_frames(
 ) -> Any:
     """Wait for `sel` on the main page first (unchanged fast path for the
     common case). If that times out, fall back to checking child frames
-    before giving up — embeddable chat widgets and login forms are
-    routinely delivered inside an <iframe>, and until now every wait_for_
-    selector call in this file only ever looked at the main frame, so that
-    case was misreported as "selector not found" instead of "selector
-    exists, but in a different frame."
-
-    Returns the target to act on — `page` itself, or the matching child
-    Frame (both expose the same .fill()/.click()/.query_selector() surface,
-    so callers can use the return value interchangeably with `page`).
-
-    Raises the ORIGINAL main-page exception if `sel` isn't found on the
-    main page OR in any child frame — callers' existing except/screenshot/
-    error-message handling is unchanged for that case.
+    before giving up.
+    
+    Returns the Locator targeting the visible element.
     """
+    sel = _ensure_visible_sel(sel)
+        
     try:
         kwargs: dict[str, Any] = {"timeout": timeout_ms}
         if state is not None:
             kwargs["state"] = state
         page.wait_for_selector(sel, **kwargs)
-        return page
+        return page.locator(sel)
     except Exception:  # noqa: BLE001
         frame = _find_in_frames(page, sel)
         if frame is not None:
-            return frame
+            return frame.locator(sel)
         raise
 
 
@@ -771,55 +772,34 @@ def _do_login(page: Any, config: "BrowserConfig") -> None:  # type: ignore[name-
 
     _debug_screenshot(page, "02_after_cookie_dismiss")
 
-    # Fill username. Waits on the main page first, falling back to a child
-    # frame if the field isn't there — login forms embedded in an <iframe>
-    # (common for some SSO/consent-manager setups) previously only ever got
-    # checked on the main page and were misreported as "selector not found".
+    # Fill username
     try:
-        username_target = _wait_for_selector_with_frames(page, username_sel, timeout_ms, state="visible")
-        username_target.fill(username_sel, config.username or "")
+        username_locator = _wait_for_selector_with_frames(page, username_sel, timeout_ms, state="visible")
+        username_locator.fill(config.username or "")
     except Exception as e:  # noqa: BLE001
-        _debug_screenshot(page, "03_username_fill_failed")
+        _debug_screenshot(page, "02_username_failed")
         raise BrowserAuthError(
-            f"[{_classify_error(e)}] Browser: username selector '{username_sel}' not found "
-            f"on '{config.login_url}'{_selector_diagnostic(page, username_sel)}: {e}"
+            f"[{_classify_error(e)}] Browser: username selector '{username_sel}' "
+            f"not found or not actionable{_selector_diagnostic(page, username_sel)}: {e}"
         ) from e
 
-    # Fill password — this used to skip straight to fill() with no wait at
-    # all, unlike username above. On SPA/React login pages the password
-    # input can render a beat after the username field (or not exist yet
-    # until a "Next" step completes), so fill() would either silently hit
-    # nothing or throw a confusing low-level error. Waiting for it to be
-    # visible first, same as username, is the main fix here.
+    # Fill password
     try:
-        password_target = _wait_for_selector_with_frames(page, password_sel, timeout_ms, state="visible")
-        password_target.fill(password_sel, config.password or "")
+        password_locator = _wait_for_selector_with_frames(page, password_sel, timeout_ms, state="visible")
+        password_locator.fill(config.password or "")
     except Exception as e:  # noqa: BLE001
-        _debug_screenshot(page, "03_password_fill_failed")
+        _debug_screenshot(page, "03_password_failed")
         raise BrowserAuthError(
-            f"[{_classify_error(e)}] Browser: password selector '{password_sel}' not found or not "
-            f"visible within {config.wait_timeout_seconds}s{_selector_diagnostic(page, password_sel)}: {e}. "
-            f"If this AUT's login is a two-step flow (email first, password on a separate "
-            f"screen after clicking Next/Continue), a single username+password "
-            f"selector pair can't handle that — let me know and I'll adjust the "
-            f"login flow to click through the intermediate step."
+            f"[{_classify_error(e)}] Browser: password selector '{password_sel}' "
+            f"not found or not actionable{_selector_diagnostic(page, password_sel)}: {e}"
         ) from e
 
     _debug_screenshot(page, "04_form_filled")
 
     # Click submit
-    # NOTE: this used to click submit_sel with no wait_for_selector() first,
-    # unlike the username/password fills above — it relied entirely on
-    # force=True to push the click through regardless of whether the button
-    # was actually visible/enabled yet, which could silently "succeed"
-    # against a not-yet-interactable button. Added the same explicit
-    # visibility wait the fill steps already had, and dropped force=True so
-    # a genuinely covered/disabled button now raises a clear error here
-    # instead of failing silently and surfacing as a confusing timeout two
-    # steps later.
     try:
-        submit_target = _wait_for_selector_with_frames(page, submit_sel, timeout_ms, state="visible")
-        submit_target.click(submit_sel)
+        submit_locator = _wait_for_selector_with_frames(page, submit_sel, timeout_ms, state="visible")
+        submit_locator.click()
     except Exception as e:  # noqa: BLE001
         _debug_screenshot(page, "05_submit_failed")
         raise BrowserAuthError(
@@ -929,18 +909,10 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
         # runs on every round — cheap, and idempotent if already open).
         if config.chat_launcher_selector:
             try:
-                launcher_target = _wait_for_selector_with_frames(
+                launcher_locator = _wait_for_selector_with_frames(
                     page, config.chat_launcher_selector, timeout_ms, state="visible"
                 )
-                # force=True used to be here, same reasoning as the login-flow
-                # clicks this connector already stopped forcing through (see
-                # _do_login): it disables the exact actionability checks that
-                # would otherwise turn "launcher is covered by a cookie banner"
-                # or "launcher isn't interactable yet" into a clear, typed
-                # error right here, instead of a confusing selector-not-found
-                # timeout two steps later on the input/send elements that
-                # never got the chance to mount.
-                launcher_target.click(config.chat_launcher_selector)
+                launcher_locator.click()
                 page.wait_for_timeout(500)  # let the modal/panel actually mount
             except Exception as e:  # noqa: BLE001
                 raise BrowserSelectorError(
@@ -967,12 +939,14 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
             send_sel = config.send_selector
             response_sel = config.response_selector
 
-        # Wait for input element — falls back to a child frame if it isn't
-        # on the main page (see _wait_for_selector_with_frames's docstring;
-        # embeddable chat widgets are routinely delivered inside an
-        # <iframe>, which previously wasn't checked here at all).
+        # Ensure all selectors are strictly visibility-filtered to fix query_selector mismatches
+        input_sel = _ensure_visible_sel(input_sel)
+        send_sel = _ensure_visible_sel(send_sel)
+        response_sel = _ensure_visible_sel(response_sel)
+
+        # Wait for input element
         try:
-            input_target = _wait_for_selector_with_frames(page, input_sel, timeout_ms)
+            input_locator = _wait_for_selector_with_frames(page, input_sel, timeout_ms)
         except Exception as e:  # noqa: BLE001
             _debug_screenshot(page, "08_input_not_found")
             raise BrowserSelectorError(
@@ -993,20 +967,8 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
                 existing_response_text = ""
 
         # Click input and type the task.
-        #
-        # This used to be page.click() + page.fill(sel, "") (a programmatic
-        # clear via one synthetic 'input' event) immediately followed by
-        # page.type() (a real keydown/input event per character) — two
-        # different input mechanisms stacked on the same field, very likely
-        # a leftover patch (one approach didn't reliably trigger some
-        # framework's controlled-input state, so the other got bolted on
-        # rather than replacing it). Now it's ONE consistent mechanism
-        # throughout: click to focus, select-all + delete via the keyboard,
-        # then type — real keydown/input events for both the clear and the
-        # entry, which is what a controlled-input framework (React, Vue,
-        # etc.) actually listens for either way.
         try:
-            input_target.click(input_sel)
+            input_locator.click()
             page.keyboard.press("Control+A")
             page.keyboard.press("Backspace")
             page.keyboard.type(task, delay=30)
@@ -1017,10 +979,10 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
                 f"'{input_sel}'{_selector_diagnostic(page, input_sel)}: {e}"
             ) from e
 
-        # Click send button — same frame-aware wait as the input above.
+        # Click send button
         try:
-            send_target = _wait_for_selector_with_frames(page, send_sel, timeout_ms)
-            send_target.click(send_sel)
+            send_locator = _wait_for_selector_with_frames(page, send_sel, timeout_ms)
+            send_locator.click()
         except Exception as e:  # noqa: BLE001
             raise BrowserSelectorError(
                 f"[{_classify_error(e)}] browser: send selector '{send_sel}' not found or "
@@ -1028,19 +990,9 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
             ) from e
 
         # ---- Verify the send actually did something -----------------------
-        # click(send_sel) not throwing used to be treated as proof the
-        # message was sent, and the code jumped straight into polling
-        # response_sel. If send_sel resolved to the wrong element — a real
-        # risk, since "form button:last-of-type" is a pure DOM-position
-        # guess in the heuristic candidate list — the click "succeeds" with
-        # no exception, and the failure only surfaced ~60s later as a
-        # response-selector timeout, actively misleading about where the
-        # real problem was. Checking that the input actually cleared (the
-        # one cheap, reliable side-effect a real send should have) catches a
-        # wrong-button click here, immediately, with a message pointing at
-        # the actual cause instead of the response wait.
         def _current_input_text() -> str:
             try:
+                # the locator might be stale, query_selector is safer here
                 el = page.query_selector(input_sel) or _query_in_frames(page, input_sel)
                 if el is None:
                     return ""
@@ -1083,9 +1035,8 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
             # Wait for response_selector to appear (may not exist yet).
             # Frame-aware, same as the input/send waits above.
             try:
-                response_target = _wait_for_selector_with_frames(page, response_sel, timeout_ms)
-                el = response_target.query_selector(response_sel)
-                response_text = el.inner_text() if el else ""
+                response_locator = _wait_for_selector_with_frames(page, response_sel, timeout_ms)
+                response_text = response_locator.inner_text() or ""
             except Exception as e:  # noqa: BLE001
                 # This wait/timeout used to be the same kind of blind spot
                 # the login-wait branch used to be (see _do_login's own
