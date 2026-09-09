@@ -902,12 +902,36 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
     start = time.perf_counter()
 
     try:
-        try:
-            page.goto(config.chatbot_url, wait_until="domcontentloaded", timeout=timeout_ms)
-        except Exception as e:  # noqa: BLE001
-            raise AUTConnectorError(
-                f"browser: could not navigate to chatbot URL '{config.chatbot_url}': {e}"
-            ) from e
+        current_url = page.url
+        needs_navigation = True
+        
+        # For Single Page Applications (SPAs), forcing a page.goto() when we are already
+        # on the correct page causes a hard browser reload. This can abort pending background 
+        # login API calls or completely wipe volatile in-memory auth states (like Redux stores),
+        # throwing the user straight back to the login screen.
+        if current_url.rstrip("/") == config.chatbot_url.rstrip("/"):
+            needs_navigation = False
+        else:
+            from urllib.parse import urlparse
+            curr_p = urlparse(current_url)
+            tgt_p = urlparse(config.chatbot_url)
+            log_p = urlparse(config.login_url) if config.login_url else None
+            
+            # If the SPA natively routed us to a different path on the same host,
+            # trust its native routing over forcing a hard reload, BUT only if
+            # we actually left the login page.
+            if curr_p.netloc == tgt_p.netloc and log_p and curr_p.path != log_p.path:
+                tgt_path = tgt_p.path.rstrip("/")
+                if tgt_path == "" or curr_p.path.startswith(tgt_path):
+                    needs_navigation = False
+
+        if needs_navigation:
+            try:
+                page.goto(config.chatbot_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            except Exception as e:  # noqa: BLE001
+                raise AUTConnectorError(
+                    f"browser: could not navigate to chatbot URL '{config.chatbot_url}': {e}"
+                ) from e
 
         # ---- Open the chat widget if it's gated behind a launcher button --
         # Some chat UIs (e.g. a floating "Open Assistant" icon) don't mount
@@ -978,16 +1002,20 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
                 f"{_selector_diagnostic(page, input_sel)}: {e}"
             ) from e
 
-        # Capture existing response text (for text_change detection). Also
-        # checks child frames — a one-shot fallback, no wait, since this is
-        # only a best-effort "what was there before" snapshot.
+        # Capture existing response text (for text_change detection) or DOM node (for new_element).
+        # Also checks child frames — a one-shot fallback, no wait.
         existing_response_text = ""
-        if config.wait_strategy == "text_change":
-            try:
+        try:
+            if config.wait_strategy == "text_change":
                 el = page.query_selector(response_sel) or _query_in_frames(page, response_sel)
                 existing_response_text = el.inner_text() if el else ""
-            except Exception:  # noqa: BLE001
-                existing_response_text = ""
+            elif config.wait_strategy == "new_element":
+                try:
+                    page.locator(response_sel).evaluate("el => { window._evalmind_last_node = el; }")
+                except Exception:  # noqa: BLE001
+                    page.evaluate("() => { window._evalmind_last_node = null; }")
+        except Exception:  # noqa: BLE001
+            pass
 
         # Click input and type the task.
         try:
@@ -1055,18 +1083,28 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
         response_text = ""
 
         if config.wait_strategy == "new_element":
-            # Wait for response_selector to appear (may not exist yet).
-            # Frame-aware, same as the input/send waits above.
+            # Wait for a strictly NEW DOM node matching response_selector to appear. 
+            # Because we no longer force a hard reload between rounds, the OLD response 
+            # from the previous round might already be in the DOM.
             try:
+                deadline = time.perf_counter() + config.wait_timeout_seconds
+                found = False
+                while time.perf_counter() < deadline:
+                    try:
+                        is_new = page.locator(response_sel).evaluate("el => el !== window._evalmind_last_node")
+                        if is_new:
+                            found = True
+                            break
+                    except Exception:  # noqa: BLE001
+                        pass
+                    page.wait_for_timeout(100)
+                    
+                if not found:
+                    raise TimeoutError(f"No new DOM node for '{response_sel}' appeared")
+                    
                 response_locator = _wait_for_selector_with_frames(page, response_sel, timeout_ms)
                 response_text = response_locator.inner_text() or ""
             except Exception as e:  # noqa: BLE001
-                # This wait/timeout used to be the same kind of blind spot
-                # the login-wait branch used to be (see _do_login's own
-                # comment on this): a failure right here — after the task
-                # was successfully typed AND the send click was verified to
-                # have cleared the input — previously raised with zero
-                # visual evidence of what the page actually did next.
                 _debug_screenshot(page, "10_response_wait_failed")
                 raise BrowserTimeoutError(
                     f"[{_classify_error(e)}] browser: response selector '{response_sel}' "
