@@ -259,16 +259,61 @@ def auto_detect_selectors(
 
     still_missing = [k for k in ("input", "send", "response") if k not in detected]
     if still_missing:
+        print(f"[browser debug] Heuristics missed {still_missing}, falling back to LLM HTML analysis...")
+        try:
+            # Strip scripts, styles, SVGs etc to save tokens and isolate structure
+            clean_html = page.evaluate('''() => {
+                let clone = document.body.cloneNode(true);
+                clone.querySelectorAll('script, style, svg, path, img, video, iframe, noscript').forEach(el => el.remove());
+                // Strip massive base64 attributes or giant class lists if needed, but innerHTML is usually okay after stripping the above
+                return clone.innerHTML;
+            }''')
+            
+            from config.llm_config import get_llm
+            llm = get_llm()
+            
+            prompt = f"""You are a web automation expert finding CSS selectors for Playwright.
+Below is the stripped HTML of a chatbot UI at {url}.
+We still need CSS selectors for: {still_missing}
+
+Identify the BEST, MOST UNIQUE CSS selector for each missing element.
+- 'input': The text input or textarea where the user types their message.
+- 'send': The send or submit button to submit the message.
+- 'response': The element containing the bot's chat response (usually the last message in a list). Use :last-child or :last-of-type if it's a list.
+
+Respond in EXACTLY this format (one selector per line, no explanation, only for the missing ones):
+INPUT_SELECTOR: <selector>
+SEND_SELECTOR: <selector>
+RESPONSE_SELECTOR: <selector>
+
+HTML:
+{clean_html[:30000]}"""
+
+            answer = llm.call(messages=[{"role": "user", "content": prompt}])
+            if not isinstance(answer, str):
+                answer = str(answer)
+                
+            for line in answer.strip().splitlines():
+                if line.startswith("INPUT_SELECTOR:") and "input" in still_missing:
+                    detected["input"] = line.split(":", 1)[1].strip()
+                elif line.startswith("SEND_SELECTOR:") and "send" in still_missing:
+                    detected["send"] = line.split(":", 1)[1].strip()
+                elif line.startswith("RESPONSE_SELECTOR:") and "response" in still_missing:
+                    detected["response"] = line.split(":", 1)[1].strip()
+                    
+            still_missing = [k for k in ("input", "send", "response") if k not in detected]
+        except Exception as e:
+            print(f"[browser debug] LLM HTML fallback failed: {e}")
+
+    if still_missing:
         role_hints = {
             "input":    "the chat text input / textarea",
             "send":     "the Send / Submit button",
             "response": "the element containing the bot's reply",
         }
-        hints = "; ".join(
-            f"'{k}' ({role_hints[k]})" for k in still_missing
-        )
+        hints = "; ".join(f"'{k}' ({role_hints[k]})" for k in still_missing)
         raise BrowserAutoDetectError(
-            f"Auto-detection could not identify selectors for: {hints} on '{url}'. "
+            f"Auto-detection (heuristics + LLM fallback) could not identify selectors for: {hints} on '{url}'. "
             f"Please open the page in Chrome, right-click each element → "
             f"Inspect → copy the selector, and paste it into the form fields."
         )
@@ -449,6 +494,49 @@ def _auto_detect_login_selectors(page: Any, login_url: str) -> dict[str, str]:
 
     missing = [k for k in ("username", "password", "submit") if k not in detected]
     if missing:
+        print(f"[browser debug] Login heuristics missed {missing}, falling back to LLM HTML analysis...")
+        try:
+            clean_html = page.evaluate('''() => {
+                let clone = document.body.cloneNode(true);
+                clone.querySelectorAll('script, style, svg, path, img, video, iframe, noscript').forEach(el => el.remove());
+                return clone.innerHTML;
+            }''')
+            from config.llm_config import get_llm
+            llm = get_llm()
+            prompt = f"""You are a web automation expert finding CSS selectors for Playwright.
+Below is the stripped HTML of a login page at {login_url}.
+We still need CSS selectors for: {missing}
+
+Identify the BEST, MOST UNIQUE CSS selector for each missing element.
+- 'username': The text input for the username or email.
+- 'password': The password input.
+- 'submit': The log in or sign in submit button.
+
+Respond in EXACTLY this format (one selector per line, no explanation, only for the missing ones):
+USERNAME_SELECTOR: <selector>
+PASSWORD_SELECTOR: <selector>
+SUBMIT_SELECTOR: <selector>
+
+HTML:
+{clean_html[:30000]}"""
+
+            answer = llm.call(messages=[{"role": "user", "content": prompt}])
+            if not isinstance(answer, str):
+                answer = str(answer)
+                
+            for line in answer.strip().splitlines():
+                if line.startswith("USERNAME_SELECTOR:") and "username" in missing:
+                    detected["username"] = line.split(":", 1)[1].strip()
+                elif line.startswith("PASSWORD_SELECTOR:") and "password" in missing:
+                    detected["password"] = line.split(":", 1)[1].strip()
+                elif line.startswith("SUBMIT_SELECTOR:") and "submit" in missing:
+                    detected["submit"] = line.split(":", 1)[1].strip()
+                    
+            missing = [k for k in ("username", "password", "submit") if k not in detected]
+        except Exception as e:
+            print(f"[browser debug] LLM HTML fallback for login failed: {e}")
+
+    if missing:
         role_hints = {
             "username": "the username / email input",
             "password": "the password input",
@@ -456,7 +544,7 @@ def _auto_detect_login_selectors(page: Any, login_url: str) -> dict[str, str]:
         }
         hints = "; ".join(f"'{k}' ({role_hints[k]})" for k in missing)
         raise BrowserAuthError(
-            f"Auto-detection could not identify login selectors for: {hints} "
+            f"Auto-detection (heuristics + LLM fallback) could not identify login selectors for: {hints} "
             f"on '{login_url}'. "
             f"Please provide them manually in the form's login section."
         )
