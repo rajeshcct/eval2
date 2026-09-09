@@ -146,60 +146,77 @@ def run_full_session(
     """
     init_db()
 
-    describer_result: Optional[DescriberResult] = None
-    if capability_description_override is not None:
-        if not capability_description_override.strip():
-            raise ValueError("capability_description_override must be a non-empty string if provided")
-        capability_description = capability_description_override
-    else:
-        # Describer runs BEFORE the session row is created - the session's
-        # aut_description is only ever written once the real description is
-        # known, auto-discovered or not.
-        describer_result = describe_aut(aut_config, on_event=on_event)
-        capability_description = describer_result.capability_description
-
-    session_id = str(uuid.uuid4())
-    insert_session(session_id, aut_description=capability_description)
-
-    active_categories = categories if categories else list(CATEGORIES)
-
-    summaries: Dict[str, CategoryLoopResult] = {}
-    for category in CATEGORIES:
-        if category not in active_categories:
-            continue
-        summaries[category] = run_category_loop(
-            category=category,
-            capability_description=capability_description,
-            aut_config=aut_config,
-            max_rounds=max_rounds,
-            session_id=session_id,
-            on_event=on_event,
-            start_difficulty=start_difficulty,
-            max_difficulty=max_difficulty,
-            pass_threshold=pass_threshold,
-        )
-
-    # Block G: one call builds AND persists the FinalReport, from the DB
-    # rows every category loop just wrote - `summaries` is passed only as a
-    # diagnostic cross-check, never as the source of report data (see
-    # aggregator.build_final_report's docstring).
+    # Everything from here down is wrapped in try/finally so that a
+    # browser-mode aut_config always gets its Chromium session torn down —
+    # success, aggregator failure, or an exception from the Describer/loop
+    # itself. close_session() (aut/playwright_connector.py) existed but was
+    # never called from anywhere in the codebase, so every completed run
+    # leaked one browser process + context for the life of the server; this
+    # is the fix. Every other mode's aut_config has no `mode == "browser"`
+    # match, so the finally block below is a single getattr + string
+    # compare for them — effectively free.
     try:
-        final_report = build_final_report(session_id, category_summaries=summaries)
-    except Exception as e:
-        emit_event(on_event, "error", {"stage": "aggregator", "message": str(e)})
-        raise
+        describer_result: Optional[DescriberResult] = None
+        if capability_description_override is not None:
+            if not capability_description_override.strip():
+                raise ValueError("capability_description_override must be a non-empty string if provided")
+            capability_description = capability_description_override
+        else:
+            # Describer runs BEFORE the session row is created - the session's
+            # aut_description is only ever written once the real description is
+            # known, auto-discovered or not.
+            describer_result = describe_aut(aut_config, on_event=on_event)
+            capability_description = describer_result.capability_description
 
-    _print_session_report(session_id, capability_description, summaries, final_report, describer_result)
+        session_id = str(uuid.uuid4())
+        insert_session(session_id, aut_description=capability_description)
 
-    emit_event(on_event, "session_completed", final_report.model_dump())
+        active_categories = categories if categories else list(CATEGORIES)
 
-    return SessionResult(
-        session_id=session_id,
-        capability_description=capability_description,
-        describer_result=describer_result,
-        summaries=summaries,
-        final_report=final_report,
-    )
+        summaries: Dict[str, CategoryLoopResult] = {}
+        for category in CATEGORIES:
+            if category not in active_categories:
+                continue
+            summaries[category] = run_category_loop(
+                category=category,
+                capability_description=capability_description,
+                aut_config=aut_config,
+                max_rounds=max_rounds,
+                session_id=session_id,
+                on_event=on_event,
+                start_difficulty=start_difficulty,
+                max_difficulty=max_difficulty,
+                pass_threshold=pass_threshold,
+            )
+
+        # Block G: one call builds AND persists the FinalReport, from the DB
+        # rows every category loop just wrote - `summaries` is passed only as a
+        # diagnostic cross-check, never as the source of report data (see
+        # aggregator.build_final_report's docstring).
+        try:
+            final_report = build_final_report(session_id, category_summaries=summaries)
+        except Exception as e:
+            emit_event(on_event, "error", {"stage": "aggregator", "message": str(e)})
+            raise
+
+        _print_session_report(session_id, capability_description, summaries, final_report, describer_result)
+
+        emit_event(on_event, "session_completed", final_report.model_dump())
+
+        return SessionResult(
+            session_id=session_id,
+            capability_description=capability_description,
+            describer_result=describer_result,
+            summaries=summaries,
+            final_report=final_report,
+        )
+    finally:
+        if getattr(aut_config, "mode", None) == "browser":
+            try:
+                from aut.playwright_connector import close_session  # local import — keeps playwright optional
+                close_session(aut_config)
+            except Exception:  # noqa: BLE001 - teardown must never mask the real result/error
+                pass
 
 
 # ==========================================================================

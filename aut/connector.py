@@ -56,6 +56,7 @@ import importlib
 import json
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, Union
 
@@ -284,6 +285,19 @@ class BrowserConfig(BaseModel):
     # response detection or interaction happens. Leave blank if the chat
     # UI is already visible/open on page load.
     chat_launcher_selector: Optional[str] = None
+
+    # Stable per-instance cache key for aut/playwright_connector.py's
+    # browser-session and selector-detection caches. Generated once, here,
+    # at construction time via a UUID — NOT derived from id(self). CPython
+    # reuses memory addresses once an object is garbage-collected, so a
+    # cache keyed by id(config) risked a brand-new BrowserConfig from a
+    # later, unrelated run silently inheriting an earlier (possibly
+    # already-closed) run's browser handle or a different site's cached
+    # selectors. A UUID generated per instance has no such collision risk,
+    # regardless of GC timing or how many BrowserConfig instances a long-
+    # running server has churned through. Never meant to be set explicitly
+    # by callers — build_browser_config() doesn't (and shouldn't) pass it.
+    session_key: str = Field(default_factory=lambda: uuid.uuid4().hex)
 
 
 AUTConfig = Annotated[

@@ -30,9 +30,11 @@ Flow per call_aut() invocation (one round):
 Thread-safety note:
   Playwright's synchronous API uses one browser instance per thread.
   BrowserSessionManager holds a single browser + context per BrowserConfig
-  instance (keyed by id(config)), reset between sessions (not between rounds
-  unless persist_session=False). The connector is always called from a
-  single worker thread inside asyncio.to_thread(), so no locking is needed.
+  instance (keyed by config.session_key, a UUID generated once per
+  BrowserConfig instance — not id(config), which CPython can reuse after
+  garbage collection), reset between sessions (not between rounds unless
+  persist_session=False). The connector is always called from a single
+  worker thread inside asyncio.to_thread(), so no locking is needed.
 
 Error handling:
   All Playwright errors are caught and re-raised as AUTConnectorError with
@@ -121,16 +123,35 @@ _RESPONSE_CANDIDATES = [
     "[class*='message']:last-child",
 ]
 
-# Cache: config id → {"input": sel, "send": sel, "response": sel}
-_SELECTOR_CACHE: dict[int, dict[str, str]] = {}
+# Cache: config.session_key → {"input": sel, "send": sel, "response": sel}
+# Keyed by the UUID-based BrowserConfig.session_key (see that field's
+# docstring in aut/connector.py) rather than id(config) — id() is a memory
+# address CPython reuses after garbage collection, which previously let a
+# later, unrelated BrowserConfig silently inherit an earlier run's cached
+# selectors for a completely different site.
+_SELECTOR_CACHE: dict[str, dict[str, str]] = {}
 
 
 def _find_first_matching(page: Any, candidates: list[str]) -> Optional[str]:
-    """Return the first selector in candidates that finds a visible element."""
+    """Return the first selector in candidates that resolves to EXACTLY ONE
+    visible element.
+
+    Previously this used page.query_selector(), which returns the first DOM
+    match with no multiplicity check — a selector could "pass" detection
+    here and then fail later when the exact same string is handed to
+    page.fill()/page.click(), which resolve selectors through Playwright's
+    strict mode (raises if 2+ elements match). That mismatch — one loose
+    resolution rule for detection, a stricter one for actual use — was a
+    real source of "the field is right there in the screenshot but the fill
+    failed" failures. Using locator().count() == 1 here means "detected as
+    usable" and "actually usable by fill()/click()" are the same check, so
+    a selector matching 2+ elements is skipped (not guessed at) rather than
+    silently deferring a strict-mode violation to a later step.
+    """
     for sel in candidates:
         try:
-            el = page.query_selector(sel)
-            if el and el.is_visible():
+            locator = page.locator(sel)
+            if locator.count() == 1 and locator.first.is_visible():
                 return sel
         except Exception:  # noqa: BLE001
             continue
@@ -207,13 +228,15 @@ def auto_detect_selectors(
     Args:
         page:       an open Playwright Page already at the chatbot URL.
         url:        the chatbot URL (used in error messages for context).
-        config:     BrowserConfig instance (used as cache key via id()).
+        config:     BrowserConfig instance (used as cache key via its
+                    stable session_key, not id() — see that field's
+                    docstring in aut/connector.py).
         timeout_ms: how long to wait for JS to render before scanning.
 
     Returns:
         dict with keys 'input', 'send', 'response' → CSS selector strings.
     """
-    key = id(config)
+    key = config.session_key
     if key in _SELECTOR_CACHE:
         return _SELECTOR_CACHE[key]
 
@@ -265,14 +288,34 @@ class _BrowserSession:
     browser: Any   # playwright Browser
     context: Any   # playwright BrowserContext
     logged_in: bool = False
+    active_pages: list[Any] = field(default_factory=list)
+
+    @property
+    def current_page(self) -> Any:
+        while self.active_pages and self.active_pages[-1].is_closed():
+            self.active_pages.pop()
+        if not self.active_pages:
+            from aut.connector import AUTConnectorError
+            raise AUTConnectorError("browser: All pages were closed unexpectedly.")
+        return self.active_pages[-1]
 
 
-_SESSIONS: dict[int, _BrowserSession] = {}  # keyed by id(config)
+class _ActivePageProxy:
+    """Proxies all attribute access to the most recently created, still-open page
+    in a session. Automatically follows popups and new tabs."""
+    def __init__(self, session: _BrowserSession):
+        self._session = session
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session.current_page, name)
+
+
+_SESSIONS: dict[str, _BrowserSession] = {}  # keyed by config.session_key (a UUID, not id(config))
 
 
 def _get_or_create_session(config: "BrowserConfig") -> _BrowserSession:  # type: ignore[name-defined]
     """Return the cached session for this config, or create a fresh one."""
-    key = id(config)
+    key = config.session_key
     if key in _SESSIONS:
         return _SESSIONS[key]
 
@@ -309,6 +352,13 @@ def _get_or_create_session(config: "BrowserConfig") -> _BrowserSession:  # type:
         """
     )
     session = _BrowserSession(browser=browser, context=context)
+    
+    def on_page(new_page: Any) -> None:
+        session.active_pages.append(new_page)
+        new_page.on("close", lambda p: session.active_pages.remove(p) if p in session.active_pages else None)
+        
+    context.on("page", on_page)
+    
     _SESSIONS[key] = session
     return session
 
@@ -316,7 +366,7 @@ def _get_or_create_session(config: "BrowserConfig") -> _BrowserSession:  # type:
 def close_session(config: "BrowserConfig") -> None:  # type: ignore[name-defined]
     """Close and discard the cached browser session for this config.
     Called after a session ends so the browser process is cleaned up."""
-    key = id(config)
+    key = config.session_key
     session = _SESSIONS.pop(key, None)
     if session is None:
         return
@@ -432,6 +482,137 @@ def _debug_screenshot(page: Any, label: str) -> None:
 
 
 # ==========================================================================
+# Error diagnostics — every Playwright failure in this file used to collapse
+# into one generic "selector not found" string regardless of whether the
+# real cause was a genuine 0-match miss, a strict-mode ambiguity (2+
+# matches), a timeout, or a closed/detached target. These two helpers add
+# that context back without changing the exception TYPES raised (still
+# BrowserAuthError/BrowserSelectorError/etc — nothing downstream that
+# catches those breaks) — only the message gets more specific.
+# ==========================================================================
+def _classify_error(e: Exception) -> str:
+    """Best-effort label for the underlying Playwright exception, so error
+    messages don't collapse every failure into one indistinguishable shape.
+    Never raises; falls back to the raw exception class name."""
+    try:
+        from playwright.sync_api import TimeoutError as PWTimeoutError
+    except Exception:  # pragma: no cover - playwright not installed
+        PWTimeoutError = ()  # type: ignore[assignment]
+
+    if PWTimeoutError and isinstance(e, PWTimeoutError):
+        return "TimeoutError"
+
+    msg = str(e)
+    if "strict mode violation" in msg:
+        return "StrictModeViolation"
+    if "Target closed" in msg or "has been closed" in msg:
+        return "TargetClosedError"
+    if "detached" in msg.lower():
+        return "ElementDetached"
+    if "intercept" in msg.lower():
+        return "ElementIntercepted"
+    return type(e).__name__
+
+
+def _selector_diagnostic(page: Any, sel: str) -> str:
+    """Best-effort extra context: how many elements `sel` currently matches.
+    Distinguishes '0 matches, genuinely not on the page' from '2+ matches,
+    ambiguous/strict-mode' — two very different root causes that used to
+    look identical from the raised error's text alone. Never raises."""
+    try:
+        count = page.locator(sel).count()
+    except Exception:  # noqa: BLE001
+        return ""
+    if count == 0:
+        return " (selector currently matches 0 elements)"
+    if count > 1:
+        return f" (selector currently matches {count} elements — ambiguous/strict-mode)"
+    return " (selector matches exactly 1 element — likely a timing/visibility issue, not a missing-element one)"
+
+
+# ==========================================================================
+# Frame-aware fallback resolution — every selector call in this file used to
+# only ever look at the main page. Embeddable chat widgets are commonly
+# delivered inside an <iframe>; when that's the case, page.wait_for_selector()
+# / page.query_selector() alone find nothing and the failure gets
+# misreported as "selector not found" rather than "selector exists, but in a
+# different frame" — the one place this file DID already look inside frames
+# was the cookie-banner dismissal loop in _do_login. These two helpers are
+# only ever consulted as a fallback AFTER a page-level lookup has already
+# failed, so a site where every element lives on the main page (the common
+# case, and everything tested against so far) sees zero behavior or timing
+# change — this is purely additive.
+# ==========================================================================
+def _find_in_frames(page: Any, sel: str) -> Optional[Any]:
+    """Search the page's CHILD frames (not the main frame, which callers
+    already try first) for a selector matching exactly one visible element.
+    Returns the Frame if found, else None."""
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        try:
+            locator = frame.locator(sel)
+            if locator.count() == 1 and locator.first.is_visible():
+                return frame
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _query_in_frames(page: Any, sel: str) -> Any:
+    """Best-effort single query (no wait) across child frames for `sel`.
+    Returns the first matching ElementHandle found, or None. Used for
+    one-shot snapshots (existing-response-text capture, fixed_delay reads)
+    rather than the strict-count check _find_in_frames does for
+    interaction targets."""
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        try:
+            el = frame.query_selector(sel)
+            if el is not None:
+                return el
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _wait_for_selector_with_frames(
+    page: Any,
+    sel: str,
+    timeout_ms: int,
+    state: Optional[str] = None,
+) -> Any:
+    """Wait for `sel` on the main page first (unchanged fast path for the
+    common case). If that times out, fall back to checking child frames
+    before giving up — embeddable chat widgets and login forms are
+    routinely delivered inside an <iframe>, and until now every wait_for_
+    selector call in this file only ever looked at the main frame, so that
+    case was misreported as "selector not found" instead of "selector
+    exists, but in a different frame."
+
+    Returns the target to act on — `page` itself, or the matching child
+    Frame (both expose the same .fill()/.click()/.query_selector() surface,
+    so callers can use the return value interchangeably with `page`).
+
+    Raises the ORIGINAL main-page exception if `sel` isn't found on the
+    main page OR in any child frame — callers' existing except/screenshot/
+    error-message handling is unchanged for that case.
+    """
+    try:
+        kwargs: dict[str, Any] = {"timeout": timeout_ms}
+        if state is not None:
+            kwargs["state"] = state
+        page.wait_for_selector(sel, **kwargs)
+        return page
+    except Exception:  # noqa: BLE001
+        frame = _find_in_frames(page, sel)
+        if frame is not None:
+            return frame
+        raise
+
+
+# ==========================================================================
 # Login helper
 # ==========================================================================
 def _do_login(page: Any, config: "BrowserConfig") -> None:  # type: ignore[name-defined]
@@ -494,22 +675,25 @@ def _do_login(page: Any, config: "BrowserConfig") -> None:  # type: ignore[name-
             try:
                 locator = frame.locator(btn).first
                 if locator.is_visible(timeout=1500):
-                    locator.click(force=True, timeout=3000)
+                    locator.click(timeout=3000)
                     page.wait_for_timeout(500)
             except Exception:
                 pass
 
     _debug_screenshot(page, "02_after_cookie_dismiss")
 
-    # Fill username
+    # Fill username. Waits on the main page first, falling back to a child
+    # frame if the field isn't there — login forms embedded in an <iframe>
+    # (common for some SSO/consent-manager setups) previously only ever got
+    # checked on the main page and were misreported as "selector not found".
     try:
-        page.wait_for_selector(username_sel, state="visible", timeout=timeout_ms)
-        page.fill(username_sel, config.username or "", force=True)
+        username_target = _wait_for_selector_with_frames(page, username_sel, timeout_ms, state="visible")
+        username_target.fill(username_sel, config.username or "")
     except Exception as e:  # noqa: BLE001
         _debug_screenshot(page, "03_username_fill_failed")
         raise BrowserAuthError(
-            f"Browser: username selector '{username_sel}' not found "
-            f"on '{config.login_url}': {e}"
+            f"[{_classify_error(e)}] Browser: username selector '{username_sel}' not found "
+            f"on '{config.login_url}'{_selector_diagnostic(page, username_sel)}: {e}"
         ) from e
 
     # Fill password — this used to skip straight to fill() with no wait at
@@ -519,14 +703,14 @@ def _do_login(page: Any, config: "BrowserConfig") -> None:  # type: ignore[name-
     # nothing or throw a confusing low-level error. Waiting for it to be
     # visible first, same as username, is the main fix here.
     try:
-        page.wait_for_selector(password_sel, state="visible", timeout=timeout_ms)
-        page.fill(password_sel, config.password or "", force=True)
+        password_target = _wait_for_selector_with_frames(page, password_sel, timeout_ms, state="visible")
+        password_target.fill(password_sel, config.password or "")
     except Exception as e:  # noqa: BLE001
         _debug_screenshot(page, "03_password_fill_failed")
         raise BrowserAuthError(
-            f"Browser: password selector '{password_sel}' not found or not "
-            f"visible within {config.wait_timeout_seconds}s: {e}. If this AUT's "
-            f"login is a two-step flow (email first, password on a separate "
+            f"[{_classify_error(e)}] Browser: password selector '{password_sel}' not found or not "
+            f"visible within {config.wait_timeout_seconds}s{_selector_diagnostic(page, password_sel)}: {e}. "
+            f"If this AUT's login is a two-step flow (email first, password on a separate "
             f"screen after clicking Next/Continue), a single username+password "
             f"selector pair can't handle that — let me know and I'll adjust the "
             f"login flow to click through the intermediate step."
@@ -535,15 +719,37 @@ def _do_login(page: Any, config: "BrowserConfig") -> None:  # type: ignore[name-
     _debug_screenshot(page, "04_form_filled")
 
     # Click submit
+    # NOTE: this used to click submit_sel with no wait_for_selector() first,
+    # unlike the username/password fills above — it relied entirely on
+    # force=True to push the click through regardless of whether the button
+    # was actually visible/enabled yet, which could silently "succeed"
+    # against a not-yet-interactable button. Added the same explicit
+    # visibility wait the fill steps already had, and dropped force=True so
+    # a genuinely covered/disabled button now raises a clear error here
+    # instead of failing silently and surfacing as a confusing timeout two
+    # steps later.
     try:
-        page.click(submit_sel, force=True)
+        submit_target = _wait_for_selector_with_frames(page, submit_sel, timeout_ms, state="visible")
+        submit_target.click(submit_sel)
     except Exception as e:  # noqa: BLE001
         _debug_screenshot(page, "05_submit_failed")
         raise BrowserAuthError(
-            f"Browser: submit selector '{submit_sel}' not found: {e}"
+            f"[{_classify_error(e)}] Browser: submit selector '{submit_sel}' "
+            f"not clickable{_selector_diagnostic(page, submit_sel)}: {e}"
         ) from e
 
     # Wait for successful login
+    #
+    # This branch used to be the one place in _do_login with NO
+    # _debug_screenshot() call on failure — every other step here takes one,
+    # but a timeout/failure right here (the actual point real runs have been
+    # failing at) previously raised with zero visual evidence of what the
+    # page actually looked like. Both branches below now capture a
+    # screenshot immediately before raising, and the error message includes
+    # the classified exception type plus (for the selector branch) how many
+    # elements the selector currently matches, so "wrong success selector"
+    # and "genuinely stuck on login" no longer look identical from the
+    # outside.
     if config.login_success_url_contains:
         try:
             page.wait_for_url(
@@ -551,20 +757,26 @@ def _do_login(page: Any, config: "BrowserConfig") -> None:  # type: ignore[name-
                 timeout=timeout_ms,
             )
         except Exception as e:  # noqa: BLE001
+            _debug_screenshot(page, "07_login_wait_failed")
             raise BrowserAuthError(
-                f"Browser: after clicking submit, URL did not contain "
+                f"[{_classify_error(e)}] Browser: after clicking submit, URL did not contain "
                 f"'{config.login_success_url_contains}' within "
-                f"{config.wait_timeout_seconds}s. Still on: {page.url!r}. "
-                f"Possible wrong credentials or CAPTCHA. Error: {e}"
+                f"{config.wait_timeout_seconds}s. Still on: {page.url!r}, title: {page.title()!r}. "
+                f"Possible wrong credentials, wrong login_success_url_contains value, or CAPTCHA. "
+                f"Error: {e}"
             ) from e
     elif config.login_success_selector:
         try:
             page.wait_for_selector(config.login_success_selector, timeout=timeout_ms)
         except Exception as e:  # noqa: BLE001
+            _debug_screenshot(page, "07_login_wait_failed")
             raise BrowserAuthError(
-                f"Browser: login success element '{config.login_success_selector}' "
-                f"did not appear within {config.wait_timeout_seconds}s. "
-                f"Possible wrong credentials or CAPTCHA. Error: {e}"
+                f"[{_classify_error(e)}] Browser: login success element "
+                f"'{config.login_success_selector}' did not appear within "
+                f"{config.wait_timeout_seconds}s{_selector_diagnostic(page, config.login_success_selector)}. "
+                f"Still on: {page.url!r}, title: {page.title()!r}. "
+                f"Possible wrong credentials, wrong login_success_selector value, or CAPTCHA. "
+                f"Error: {e}"
             ) from e
     else:
         # Generic fallback: wait 2s for the page to settle after submit
@@ -591,15 +803,17 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
 
     # ---- Login (once per session) ----------------------------------------
     if config.requires_login and not session.logged_in:
-        login_page = session.context.new_page()
+        initial_login_page = session.context.new_page()
+        login_page = _ActivePageProxy(session)
         try:
             _do_login(login_page, config)
             session.logged_in = True
         finally:
-            login_page.close()
+            initial_login_page.close()
 
     # ---- Open chatbot page -----------------------------------------------
-    page = session.context.new_page()
+    initial_page = session.context.new_page()
+    page = _ActivePageProxy(session)
     start = time.perf_counter()
 
     try:
@@ -619,13 +833,24 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
         # runs on every round — cheap, and idempotent if already open).
         if config.chat_launcher_selector:
             try:
-                page.wait_for_selector(config.chat_launcher_selector, state="visible", timeout=timeout_ms)
-                page.click(config.chat_launcher_selector, force=True)
+                launcher_target = _wait_for_selector_with_frames(
+                    page, config.chat_launcher_selector, timeout_ms, state="visible"
+                )
+                # force=True used to be here, same reasoning as the login-flow
+                # clicks this connector already stopped forcing through (see
+                # _do_login): it disables the exact actionability checks that
+                # would otherwise turn "launcher is covered by a cookie banner"
+                # or "launcher isn't interactable yet" into a clear, typed
+                # error right here, instead of a confusing selector-not-found
+                # timeout two steps later on the input/send elements that
+                # never got the chance to mount.
+                launcher_target.click(config.chat_launcher_selector)
                 page.wait_for_timeout(500)  # let the modal/panel actually mount
             except Exception as e:  # noqa: BLE001
                 raise BrowserSelectorError(
-                    f"browser: chat launcher selector '{config.chat_launcher_selector}' "
-                    f"not found or not clickable on '{config.chatbot_url}': {e}"
+                    f"[{_classify_error(e)}] browser: chat launcher selector "
+                    f"'{config.chat_launcher_selector}' not found or not clickable "
+                    f"on '{config.chatbot_url}'{_selector_diagnostic(page, config.chat_launcher_selector)}: {e}"
                 ) from e
 
         # ---- Auto-detect selectors if any were left blank -------------------
@@ -646,99 +871,204 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
             send_sel = config.send_selector
             response_sel = config.response_selector
 
-        # Wait for input element
+        # Wait for input element — falls back to a child frame if it isn't
+        # on the main page (see _wait_for_selector_with_frames's docstring;
+        # embeddable chat widgets are routinely delivered inside an
+        # <iframe>, which previously wasn't checked here at all).
         try:
-            page.wait_for_selector(input_sel, timeout=timeout_ms)
+            input_target = _wait_for_selector_with_frames(page, input_sel, timeout_ms)
         except Exception as e:  # noqa: BLE001
+            _debug_screenshot(page, "08_input_not_found")
             raise BrowserSelectorError(
-                f"browser: input selector '{input_sel}' not found "
-                f"on '{config.chatbot_url}' within {config.wait_timeout_seconds}s: {e}"
+                f"[{_classify_error(e)}] browser: input selector '{input_sel}' not found "
+                f"on '{config.chatbot_url}' within {config.wait_timeout_seconds}s"
+                f"{_selector_diagnostic(page, input_sel)}: {e}"
             ) from e
 
-        # Capture existing response text (for text_change detection)
+        # Capture existing response text (for text_change detection). Also
+        # checks child frames — a one-shot fallback, no wait, since this is
+        # only a best-effort "what was there before" snapshot.
         existing_response_text = ""
         if config.wait_strategy == "text_change":
             try:
-                el = page.query_selector(response_sel)
+                el = page.query_selector(response_sel) or _query_in_frames(page, response_sel)
                 existing_response_text = el.inner_text() if el else ""
             except Exception:  # noqa: BLE001
                 existing_response_text = ""
 
-        # Click input and type the task
+        # Click input and type the task.
+        #
+        # This used to be page.click() + page.fill(sel, "") (a programmatic
+        # clear via one synthetic 'input' event) immediately followed by
+        # page.type() (a real keydown/input event per character) — two
+        # different input mechanisms stacked on the same field, very likely
+        # a leftover patch (one approach didn't reliably trigger some
+        # framework's controlled-input state, so the other got bolted on
+        # rather than replacing it). Now it's ONE consistent mechanism
+        # throughout: click to focus, select-all + delete via the keyboard,
+        # then type — real keydown/input events for both the clear and the
+        # entry, which is what a controlled-input framework (React, Vue,
+        # etc.) actually listens for either way.
         try:
-            page.click(input_sel)
-            # Clear any existing text first
-            page.fill(input_sel, "")
-            page.type(input_sel, task, delay=30)
+            input_target.click(input_sel)
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Backspace")
+            page.keyboard.type(task, delay=30)
         except Exception as e:  # noqa: BLE001
+            _debug_screenshot(page, "09_type_failed")
             raise BrowserSelectorError(
-                f"browser: could not type into input '{input_sel}': {e}"
+                f"[{_classify_error(e)}] browser: could not type into input "
+                f"'{input_sel}'{_selector_diagnostic(page, input_sel)}: {e}"
             ) from e
 
-        # Click send button
+        # Click send button — same frame-aware wait as the input above.
         try:
-            page.wait_for_selector(send_sel, timeout=timeout_ms)
-            page.click(send_sel)
+            send_target = _wait_for_selector_with_frames(page, send_sel, timeout_ms)
+            send_target.click(send_sel)
         except Exception as e:  # noqa: BLE001
             raise BrowserSelectorError(
-                f"browser: send selector '{send_sel}' not found or "
-                f"not clickable: {e}"
+                f"[{_classify_error(e)}] browser: send selector '{send_sel}' not found or "
+                f"not clickable{_selector_diagnostic(page, send_sel)}: {e}"
             ) from e
+
+        # ---- Verify the send actually did something -----------------------
+        # click(send_sel) not throwing used to be treated as proof the
+        # message was sent, and the code jumped straight into polling
+        # response_sel. If send_sel resolved to the wrong element — a real
+        # risk, since "form button:last-of-type" is a pure DOM-position
+        # guess in the heuristic candidate list — the click "succeeds" with
+        # no exception, and the failure only surfaced ~60s later as a
+        # response-selector timeout, actively misleading about where the
+        # real problem was. Checking that the input actually cleared (the
+        # one cheap, reliable side-effect a real send should have) catches a
+        # wrong-button click here, immediately, with a message pointing at
+        # the actual cause instead of the response wait.
+        def _current_input_text() -> str:
+            try:
+                el = page.query_selector(input_sel) or _query_in_frames(page, input_sel)
+                if el is None:
+                    return ""
+            except Exception:  # noqa: BLE001
+                return ""
+            try:
+                value = el.input_value()
+                if value:
+                    return value
+            except Exception:  # noqa: BLE001
+                pass  # not an input/textarea/select — fall through to inner_text
+            try:
+                return el.inner_text() or ""
+            except Exception:  # noqa: BLE001
+                return ""
+
+        cleared = False
+        clear_deadline = time.perf_counter() + 3.0
+        while time.perf_counter() < clear_deadline:
+            if task not in _current_input_text():
+                cleared = True
+                break
+            page.wait_for_timeout(150)
+
+        if not cleared:
+            raise BrowserSelectorError(
+                f"browser: clicked send selector '{send_sel}' but input "
+                f"'{input_sel}' still contains the typed task 3s later. This "
+                f"usually means send_sel resolved to the wrong element (a "
+                f"heuristic like 'form button:last-of-type' can match a "
+                f"toolbar/regenerate button instead of Send) rather than a "
+                f"slow-to-respond chatbot. Provide an explicit send_selector "
+                f"if this one was auto-detected."
+            )
 
         # ---- Wait for response -------------------------------------------
         response_text = ""
 
         if config.wait_strategy == "new_element":
-            # Wait for response_selector to appear (may not exist yet)
+            # Wait for response_selector to appear (may not exist yet).
+            # Frame-aware, same as the input/send waits above.
             try:
-                page.wait_for_selector(response_sel, timeout=timeout_ms)
-                el = page.query_selector(response_sel)
+                response_target = _wait_for_selector_with_frames(page, response_sel, timeout_ms)
+                el = response_target.query_selector(response_sel)
                 response_text = el.inner_text() if el else ""
             except Exception as e:  # noqa: BLE001
+                # This wait/timeout used to be the same kind of blind spot
+                # the login-wait branch used to be (see _do_login's own
+                # comment on this): a failure right here — after the task
+                # was successfully typed AND the send click was verified to
+                # have cleared the input — previously raised with zero
+                # visual evidence of what the page actually did next.
+                _debug_screenshot(page, "10_response_wait_failed")
                 raise BrowserTimeoutError(
-                    f"browser: response selector '{response_sel}' "
-                    f"did not appear within {config.wait_timeout_seconds}s: {e}"
+                    f"[{_classify_error(e)}] browser: response selector '{response_sel}' "
+                    f"did not appear within {config.wait_timeout_seconds}s"
+                    f"{_selector_diagnostic(page, response_sel)}. Still on: {page.url!r}. Error: {e}"
                 ) from e
 
         elif config.wait_strategy == "text_change":
-            # Poll until inner_text of response_selector changes
+            # Poll until inner_text of response_selector changes AND stays
+            # unchanged for at least STABILITY_WINDOW_SECONDS.
+            #
+            # This used to accept the FIRST read that merely differed from
+            # existing_response_text — a single differing read is a real
+            # correctness gap for any UI that mutates the response node more
+            # than once (e.g. shows a "typing…"/streaming partial, then
+            # replaces it with the final text): the partial would get
+            # captured and scored as if it were the finished answer. Now a
+            # candidate text has to be read as unchanged across consecutive
+            # polls spanning at least STABILITY_WINDOW_SECONDS before it's
+            # accepted — a genuinely-finished response naturally satisfies
+            # this within one extra poll cycle; a still-streaming one keeps
+            # resetting the stability clock every time it mutates.
+            STABILITY_WINDOW_SECONDS = 1.0
             deadline = time.perf_counter() + config.wait_timeout_seconds
             found = False
+            last_seen_text: Optional[str] = None
+            stable_since: Optional[float] = None
             while time.perf_counter() < deadline:
                 try:
-                    el = page.query_selector(response_sel)
+                    el = page.query_selector(response_sel) or _query_in_frames(page, response_sel)
                     if el:
                         text = el.inner_text()
                         if text and text != existing_response_text:
-                            response_text = text
-                            found = True
-                            break
+                            if text != last_seen_text:
+                                last_seen_text = text
+                                stable_since = time.perf_counter()
+                            elif (
+                                stable_since is not None
+                                and (time.perf_counter() - stable_since) >= STABILITY_WINDOW_SECONDS
+                            ):
+                                response_text = text
+                                found = True
+                                break
                 except Exception:  # noqa: BLE001
                     pass
                 page.wait_for_timeout(500)
 
             if not found:
+                _debug_screenshot(page, "10_response_wait_failed")
                 raise BrowserTimeoutError(
                     f"browser: response text did not change within "
-                    f"{config.wait_timeout_seconds}s (selector: '{response_sel}'). "
+                    f"{config.wait_timeout_seconds}s (selector: '{response_sel}')"
+                    f"{_selector_diagnostic(page, response_sel)}. Still on: {page.url!r}. "
                     f"The chatbot may still be generating or the selector is wrong."
                 )
 
         elif config.wait_strategy == "fixed_delay":
             page.wait_for_timeout(int(config.fixed_delay_seconds * 1000))
             try:
-                el = page.query_selector(response_sel)
+                el = page.query_selector(response_sel) or _query_in_frames(page, response_sel)
                 response_text = el.inner_text() if el else ""
             except Exception as e:  # noqa: BLE001
+                _debug_screenshot(page, "10_response_wait_failed")
                 raise BrowserSelectorError(
-                    f"browser: response selector '{response_sel}' "
-                    f"not found after fixed delay: {e}"
+                    f"[{_classify_error(e)}] browser: response selector '{response_sel}' "
+                    f"not found after fixed delay{_selector_diagnostic(page, response_sel)}: {e}"
                 ) from e
 
         latency_ms = (time.perf_counter() - start) * 1000
 
     finally:
-        page.close()
+        initial_page.close()
 
     if not response_text.strip():
         raise AUTConnectorError(
