@@ -294,9 +294,12 @@ LAUNCHER_SELECTOR: <selector or None>
 HTML:
 {clean_html[:30000]}"""
 
+            print(f"[browser debug] Calling LLM ({type(llm).__name__}) for selector detection...")
             answer = llm.call(messages=[{"role": "user", "content": prompt}])
             if not isinstance(answer, str):
                 answer = str(answer)
+            
+            print(f"[browser debug] LLM HTML fallback RAW ANSWER:\n{answer[:2000]}")
                 
             for line in answer.strip().splitlines():
                 if line.startswith("INPUT_SELECTOR:") and "input" in still_missing:
@@ -312,6 +315,16 @@ HTML:
                     
             still_missing = [k for k in ("input", "send", "response") if k not in detected]
         except Exception as e:
+            from config.llm_config import MissingAPIKeyError
+            if isinstance(e, MissingAPIKeyError):
+                raise BrowserAutoDetectError(
+                    f"LLM HTML fallback cannot run: no API key is configured. "
+                    f"Set LLM_PROVIDER and the matching *_API_KEY in your .env file. "
+                    f"Error: {e}\n\n"
+                    f"WORKAROUND: Open the chatbot page in Chrome DevTools, right-click "
+                    f"each element → Inspect → Copy selector, then paste them into the "
+                    f"form's input_selector / send_selector / response_selector fields."
+                ) from e
             print(f"[browser debug] LLM HTML fallback failed: {e}")
 
     if still_missing:
@@ -543,6 +556,14 @@ HTML:
                     
             missing = [k for k in ("username", "password", "submit") if k not in detected]
         except Exception as e:
+            from config.llm_config import MissingAPIKeyError
+            if isinstance(e, MissingAPIKeyError):
+                raise BrowserAuthError(
+                    f"LLM fallback for login selector detection cannot run: no API key is configured. "
+                    f"Set LLM_PROVIDER and the matching *_API_KEY in your .env file. Error: {e}\n\n"
+                    f"WORKAROUND: Provide username_selector, password_selector, and submit_selector "
+                    f"manually in the form's login section."
+                ) from e
             print(f"[browser debug] LLM HTML fallback for login failed: {e}")
 
     if missing:
