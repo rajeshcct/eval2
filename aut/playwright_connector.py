@@ -43,6 +43,7 @@ Error handling:
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -172,6 +173,186 @@ def _is_chat_response_selector(sel: str) -> bool:
     return not any(clue in s for clue in _NOT_CHAT_RESPONSE_CLUES)
 
 
+# Keywords that betray a selector as something other than the actual
+# 'submit this message' button — a regenerate/attach/mic/like button, or
+# an unrelated submit button elsewhere on the page (login, search,
+# newsletter signup). SEND previously had no equivalent filter at all,
+# unlike INPUT and RESPONSE above.
+_NOT_CHAT_SEND_CLUES = (
+    "regenerate",
+    "delete",
+    "remove",
+    "clear",
+    "copy",
+    "thumb",
+    "like",
+    "dislike",
+    "attach",
+    "upload",
+    "mic",
+    "microphone",
+    "voice",
+    "emoji",
+    "stop",
+    "cancel",
+    "close",
+    "menu",
+    "search",
+    "filter",
+    "login",
+    "signin",
+    "sign-in",
+    "subscribe",
+    "newsletter",
+)
+
+
+def _is_chat_send_selector(sel: str) -> bool:
+    """Return False if the selector looks like it targets something other
+    than the chat's actual send/submit button."""
+    s = sel.lower()
+    return not any(clue in s for clue in _NOT_CHAT_SEND_CLUES)
+
+
+# The two SEND heuristics generic enough to match something completely
+# unrelated to the chat widget (any lone <button type=submit> on the whole
+# page, or the last button in ANY <form>). A stray match from either one
+# used to be accepted outright, BEFORE the LLM fallback even ran (it only
+# runs for roles still missing after heuristics) — this is the single
+# biggest source of 'send click does nothing' failures.
+_GENERIC_SEND_PATTERNS = {"button[type='submit']", "form button:last-of-type"}
+
+
+def _shares_container(page: Any, sel_a: str, sel_b: str, max_ancestors: int = 6) -> bool:
+    """Best-effort check that two selectors resolve to elements sharing a
+    reasonably close common ancestor (i.e. both live inside the same chat
+    widget) rather than being unrelated parts of the page. Only used to
+    veto the two _GENERIC_SEND_PATTERNS above when they matched by
+    accident. Returns True (does not veto) on any evaluation error or
+    missing element, so this can never block a legitimate match."""
+    try:
+        return bool(page.evaluate(
+            """([selA, selB, maxUp]) => {
+                const a = document.querySelector(selA);
+                const b = document.querySelector(selB);
+                if (!a || !b) return true;
+                let node = a;
+                for (let i = 0; i <= maxUp; i++) {
+                    if (!node) break;
+                    if (node.contains(b)) return true;
+                    node = node.parentElement;
+                }
+                return false;
+            }""",
+            [sel_a, sel_b, max_ancestors],
+        ))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _detect_heuristics(page: Any, detected: dict[str, str]) -> None:
+    """Run the INPUT/SEND/RESPONSE heuristics and write results into
+    `detected` in place. SEND now gets the same semantic-clue rejection
+    INPUT/RESPONSE already had, plus a container-proximity check for the
+    two overly generic SEND patterns — previously an unrelated
+    button[type=submit] elsewhere on the page (login/search/newsletter
+    form) could win the 'send' role by accident, and because that removed
+    'send' from still_missing, the LLM fallback was never even consulted
+    for it."""
+    inp = _find_first_matching(page, _INPUT_CANDIDATES)
+    if inp:
+        detected["input"] = inp
+
+    snd = _find_first_matching(page, _SEND_CANDIDATES)
+    if snd:
+        if not _is_chat_send_selector(snd):
+            print(f"[browser debug] Heuristic SEND candidate '{snd}' rejected — matches a non-send clue (regenerate/attach/mic/etc.)")
+        elif snd in _GENERIC_SEND_PATTERNS and "input" in detected and not _shares_container(page, detected["input"], snd):
+            print(f"[browser debug] Heuristic SEND candidate '{snd}' rejected — not in the same container as the input; likely an unrelated submit button elsewhere on the page")
+        else:
+            detected["send"] = snd
+
+    resp = _find_first_matching(page, _RESPONSE_CANDIDATES)
+    if resp:
+        detected["response"] = resp
+
+
+def _clean_selector(raw: str) -> str:
+    """Strip common LLM formatting artifacts (backticks, wrapping quotes,
+    markdown bold, trailing punctuation) before a selector is ever handed
+    to Playwright."""
+    s = raw.strip()
+    s = s.strip("`").strip("*").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1].strip()
+    return s.rstrip(".,;").strip()
+
+
+_SELECTOR_LINE_RE = re.compile(
+    r"^\s*(INPUT|SEND|RESPONSE|LAUNCHER)[_ ]?SELECTOR\s*:\s*(.*)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_selector_lines(answer: str) -> dict[str, str]:
+    """Robustly parse 'ROLE_SELECTOR: value' lines out of an LLM answer.
+    Tolerant of extra whitespace around the colon, lowercase role names,
+    and 'ROLE SELECTOR' (space instead of underscore) — the previous
+    line.startswith('SEND_SELECTOR:') check dropped the whole line on any
+    of these drifts."""
+    out: dict[str, str] = {}
+    for line in answer.strip().splitlines():
+        m = _SELECTOR_LINE_RE.match(line)
+        if not m:
+            continue
+        role = m.group(1).lower()
+        val = _clean_selector(m.group(2))
+        if val and val.lower() not in ("none", "null", ""):
+            out[role] = val
+    return out
+
+
+def _selector_exists(page: Any, sel: str) -> bool:
+    """Best-effort check that `sel` currently resolves to at least one
+    element in the live DOM. An LLM-sourced selector previously had NO
+    such check — a hallucinated string was trusted outright and only
+    failed much later, at click time, with a confusing error."""
+    try:
+        return page.locator(sel).count() >= 1
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _apply_llm_selectors(page: Any, answer: str, detected: dict[str, str],
+                          only_roles: Optional[set[str]] = None) -> None:
+    """Parse an LLM selector answer and merge validated results into
+    `detected`. Every role (including SEND, which previously had no
+    validation at all) is checked against its semantic-clue filter AND
+    verified to actually exist in the live DOM before being accepted."""
+    parsed = _parse_selector_lines(answer)
+
+    for role, validator in (
+        ("input", _is_chat_input_selector),
+        ("send", _is_chat_send_selector),
+        ("response", _is_chat_response_selector),
+    ):
+        if only_roles is not None and role not in only_roles:
+            continue
+        candidate = parsed.get(role)
+        if not candidate:
+            continue
+        if not validator(candidate):
+            print(f"[browser debug] LLM {role.upper()}_SELECTOR '{candidate}' rejected — fails semantic check for role '{role}'")
+            continue
+        if not _selector_exists(page, candidate):
+            print(f"[browser debug] LLM {role.upper()}_SELECTOR '{candidate}' rejected — does not match any element in the live DOM (likely hallucinated)")
+            continue
+        detected[role] = candidate
+
+    if only_roles is None and "launcher" in parsed:
+        detected["launcher"] = parsed["launcher"]
+
+
 def _find_first_matching(page: Any, candidates: list[str]) -> Optional[str]:
     """Return the first selector in candidates that resolves to EXACTLY ONE
     visible element.
@@ -285,17 +466,7 @@ def auto_detect_selectors(
 
     detected: dict[str, str] = {}
 
-    inp = _find_first_matching(page, _INPUT_CANDIDATES)
-    if inp:
-        detected["input"] = inp
-
-    snd = _find_first_matching(page, _SEND_CANDIDATES)
-    if snd:
-        detected["send"] = snd
-
-    resp = _find_first_matching(page, _RESPONSE_CANDIDATES)
-    if resp:
-        detected["response"] = resp
+    _detect_heuristics(page, detected)
 
     still_missing = [k for k in ("input", "send", "response") if k not in detected]
     if still_missing:
@@ -341,26 +512,7 @@ HTML:
             
             print(f"[browser debug] LLM HTML fallback RAW ANSWER:\n{answer[:2000]}")
                 
-            for line in answer.strip().splitlines():
-                if line.startswith("INPUT_SELECTOR:") and "input" in still_missing:
-                    candidate = line.split(":", 1)[1].strip()
-                    if _is_chat_input_selector(candidate):
-                        detected["input"] = candidate
-                    else:
-                        print(f"[browser debug] LLM INPUT_SELECTOR '{candidate}' rejected — looks like a dropdown/filter, not a chat input")
-                elif line.startswith("SEND_SELECTOR:") and "send" in still_missing:
-                    detected["send"] = line.split(":", 1)[1].strip()
-                elif line.startswith("RESPONSE_SELECTOR:") and "response" in still_missing:
-                    candidate = line.split(":", 1)[1].strip()
-                    if _is_chat_response_selector(candidate):
-                        detected["response"] = candidate
-                    else:
-                        print(f"[browser debug] LLM RESPONSE_SELECTOR '{candidate}' rejected — looks like a generic container, not a chat message element")
-                elif line.startswith("LAUNCHER_SELECTOR:"):
-                    sel = line.split(":", 1)[1].strip()
-                    if sel and sel.lower() not in ["none", "null", ""]:
-                        detected["launcher"] = sel
-                    
+            _apply_llm_selectors(page, answer, detected)
             still_missing = [k for k in ("input", "send", "response") if k not in detected]
             
             # ── Phase 2: if LLM found a launcher, click it then re-detect ALL selectors ──
@@ -379,16 +531,9 @@ HTML:
                     for k in ("input", "send", "response"):
                         detected.pop(k, None)
                     
-                    # Try fast heuristics first (free, no LLM call)
-                    re_inp = _find_first_matching(page, _INPUT_CANDIDATES)
-                    if re_inp:
-                        detected["input"] = re_inp
-                    re_snd = _find_first_matching(page, _SEND_CANDIDATES)
-                    if re_snd:
-                        detected["send"] = re_snd
-                    re_resp = _find_first_matching(page, _RESPONSE_CANDIDATES)
-                    if re_resp:
-                        detected["response"] = re_resp
+                    # Try fast heuristics first (free, no LLM call) — now
+                    # with the same SEND validation as the initial pass.
+                    _detect_heuristics(page, detected)
                     
                     still_missing = [k for k in ("input", "send", "response") if k not in detected]
                     
@@ -422,21 +567,7 @@ HTML:
                     if not isinstance(answer2, str):
                         answer2 = str(answer2)
                     print(f"[browser debug] Open-panel LLM pass RAW ANSWER:\n{answer2[:1000]}")
-                    for line2 in answer2.strip().splitlines():
-                        if line2.startswith("INPUT_SELECTOR:"):
-                            c = line2.split(":", 1)[1].strip()
-                            if _is_chat_input_selector(c):
-                                detected["input"] = c
-                            else:
-                                print(f"[browser debug] Open-panel LLM INPUT '{c}' rejected — looks like dropdown/filter")
-                        elif line2.startswith("SEND_SELECTOR:"):
-                            detected["send"] = line2.split(":", 1)[1].strip()
-                        elif line2.startswith("RESPONSE_SELECTOR:"):
-                            c = line2.split(":", 1)[1].strip()
-                            if _is_chat_response_selector(c):
-                                detected["response"] = c
-                            else:
-                                print(f"[browser debug] Open-panel LLM RESPONSE '{c}' rejected — looks like generic container")
+                    _apply_llm_selectors(page, answer2, detected, only_roles={"input", "send", "response"})
                     still_missing = [k for k in ("input", "send", "response") if k not in detected]
                 except Exception as launcher_err:
                     print(f"[browser debug] Launcher click/re-scan failed: {launcher_err}")
