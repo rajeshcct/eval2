@@ -60,3 +60,4 @@ logs/
 tests/sample_manual_outputs.json
 frontend/package-lock.json
 frontend/package-lock.json
+debug_screenshots/

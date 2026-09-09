@@ -289,6 +289,7 @@ class _BrowserSession:
     context: Any   # playwright BrowserContext
     logged_in: bool = False
     active_pages: list[Any] = field(default_factory=list)
+    main_page: Any = None
 
     @property
     def current_page(self) -> Any:
@@ -756,6 +757,8 @@ def _do_login(page: Any, config: "BrowserConfig") -> None:  # type: ignore[name-
                 f"**{config.login_success_url_contains}**",
                 timeout=timeout_ms,
             )
+            # FIX: give SPA time to write to localStorage before closing the page
+            page.wait_for_timeout(3000)
         except Exception as e:  # noqa: BLE001
             _debug_screenshot(page, "07_login_wait_failed")
             raise BrowserAuthError(
@@ -768,6 +771,8 @@ def _do_login(page: Any, config: "BrowserConfig") -> None:  # type: ignore[name-
     elif config.login_success_selector:
         try:
             page.wait_for_selector(config.login_success_selector, timeout=timeout_ms)
+            # FIX: give SPA time to write to localStorage before closing the page
+            page.wait_for_timeout(3000)
         except Exception as e:  # noqa: BLE001
             _debug_screenshot(page, "07_login_wait_failed")
             raise BrowserAuthError(
@@ -779,8 +784,8 @@ def _do_login(page: Any, config: "BrowserConfig") -> None:  # type: ignore[name-
                 f"Error: {e}"
             ) from e
     else:
-        # Generic fallback: wait 2s for the page to settle after submit
-        page.wait_for_timeout(2000)
+        # Generic fallback: wait 3s for the page to settle after submit
+        page.wait_for_timeout(3000)
 
     _debug_screenshot(page, "06_login_success")
 
@@ -801,19 +806,22 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
 
     session = _get_or_create_session(config)
 
+    if session.main_page is None or session.main_page.is_closed():
+        session.main_page = session.context.new_page()
+
+    page = _ActivePageProxy(session)
+
     # ---- Login (once per session) ----------------------------------------
     if config.requires_login and not session.logged_in:
-        initial_login_page = session.context.new_page()
-        login_page = _ActivePageProxy(session)
         try:
-            _do_login(login_page, config)
+            _do_login(page, config)
             session.logged_in = True
-        finally:
-            initial_login_page.close()
+        except Exception:
+            # If login fails, we don't want to leave the page in a broken half-logged-in state
+            session.main_page.close()
+            raise
 
     # ---- Open chatbot page -----------------------------------------------
-    initial_page = session.context.new_page()
-    page = _ActivePageProxy(session)
     start = time.perf_counter()
 
     try:
@@ -1068,7 +1076,7 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
         latency_ms = (time.perf_counter() - start) * 1000
 
     finally:
-        initial_page.close()
+        pass
 
     if not response_text.strip():
         raise AUTConnectorError(
