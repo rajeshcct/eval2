@@ -131,6 +131,46 @@ _RESPONSE_CANDIDATES = [
 # selectors for a completely different site.
 _SELECTOR_CACHE: dict[str, dict[str, str]] = {}
 
+# Keywords that betray a selector as a dropdown/autocomplete/filter rather
+# than a genuine free-text chat input. When the LLM hallucinates one of these
+# as the "input" we discard it and fall through to the BrowserAutoDetectError.
+_NOT_CHAT_INPUT_CLUES = (
+    "vs__search",       # Vue Select dropdown search
+    "combobox",
+    "autocomplete",
+    "select",           # <select> dropdowns
+    "dropdown",
+    "filter",
+    "search",           # generic search bars on dashboards
+    "typeahead",
+)
+
+# Keywords that reveal a generic page container rather than a chat message.
+# Accepting these as response_sel means text_change never fires because the
+# container existed before the chat started.
+_NOT_CHAT_RESPONSE_CLUES = (
+    "card-body",        # Bootstrap generic card — present from page load
+    "card",
+    "dashboard",
+    "sidebar",
+    "navbar",
+    "header",
+    "footer",
+    "modal",
+)
+
+
+def _is_chat_input_selector(sel: str) -> bool:
+    """Return False if the selector looks like a dropdown / filter, not a chat input."""
+    s = sel.lower()
+    return not any(clue in s for clue in _NOT_CHAT_INPUT_CLUES)
+
+
+def _is_chat_response_selector(sel: str) -> bool:
+    """Return False if the selector looks like a generic page section, not a message container."""
+    s = sel.lower()
+    return not any(clue in s for clue in _NOT_CHAT_RESPONSE_CLUES)
+
 
 def _find_first_matching(page: Any, candidates: list[str]) -> Optional[str]:
     """Return the first selector in candidates that resolves to EXACTLY ONE
@@ -303,17 +343,94 @@ HTML:
                 
             for line in answer.strip().splitlines():
                 if line.startswith("INPUT_SELECTOR:") and "input" in still_missing:
-                    detected["input"] = line.split(":", 1)[1].strip()
+                    candidate = line.split(":", 1)[1].strip()
+                    if _is_chat_input_selector(candidate):
+                        detected["input"] = candidate
+                    else:
+                        print(f"[browser debug] LLM INPUT_SELECTOR '{candidate}' rejected — looks like a dropdown/filter, not a chat input")
                 elif line.startswith("SEND_SELECTOR:") and "send" in still_missing:
                     detected["send"] = line.split(":", 1)[1].strip()
                 elif line.startswith("RESPONSE_SELECTOR:") and "response" in still_missing:
-                    detected["response"] = line.split(":", 1)[1].strip()
+                    candidate = line.split(":", 1)[1].strip()
+                    if _is_chat_response_selector(candidate):
+                        detected["response"] = candidate
+                    else:
+                        print(f"[browser debug] LLM RESPONSE_SELECTOR '{candidate}' rejected — looks like a generic container, not a chat message element")
                 elif line.startswith("LAUNCHER_SELECTOR:"):
                     sel = line.split(":", 1)[1].strip()
                     if sel and sel.lower() not in ["none", "null", ""]:
                         detected["launcher"] = sel
                     
             still_missing = [k for k in ("input", "send", "response") if k not in detected]
+            
+            # ── Phase 2: if LLM found a launcher, click it then re-scan ──────
+            # The page we analyzed was the CLOSED state of the chat widget.
+            # We MUST click the launcher first, THEN re-run both heuristics
+            # AND a second LLM pass with the newly-visible chat HTML.
+            if detected.get("launcher"):
+                launcher_sel = detected["launcher"]
+                try:
+                    page.locator(launcher_sel).first.click()
+                    page.wait_for_timeout(1500)  # let the panel fully mount
+                    print(f"[browser debug] Clicked LLM-detected launcher '{launcher_sel}', re-scanning for selectors...")
+                    
+                    # Re-run heuristics on the now-open panel
+                    if "input" in still_missing or not _is_chat_input_selector(detected.get("input", "")):
+                        re_inp = _find_first_matching(page, _INPUT_CANDIDATES)
+                        if re_inp:
+                            detected["input"] = re_inp
+                    if "send" in still_missing:
+                        re_snd = _find_first_matching(page, _SEND_CANDIDATES)
+                        if re_snd:
+                            detected["send"] = re_snd
+                    if "response" in still_missing:
+                        re_resp = _find_first_matching(page, _RESPONSE_CANDIDATES)
+                        if re_resp:
+                            detected["response"] = re_resp
+                    
+                    still_missing = [k for k in ("input", "send", "response") if k not in detected]
+                    
+                    # If still missing, do a second LLM pass with the new post-launcher HTML
+                    if still_missing:
+                        print(f"[browser debug] Still missing {still_missing} after launcher click, running second LLM pass...")
+                        clean_html2 = page.evaluate('''() => {
+                            let clone = document.body.cloneNode(true);
+                            clone.querySelectorAll('script, style, svg, path, img, video, iframe, noscript').forEach(el => el.remove());
+                            return clone.innerHTML;
+                        }''')
+                        prompt2 = f"""You are a web automation expert. A chat panel has just been opened on {url}.
+The HTML below shows the OPEN chat widget. Find CSS selectors for: {still_missing}
+
+CRITICAL: Only look for the CHAT elements — the text input where users TYPE messages,
+the SEND button that submits messages, and the container where BOT REPLIES appear.
+Do NOT suggest filter dropdowns, search bars, dashboard cards, or generic containers.
+
+Respond ONLY in this exact format:
+INPUT_SELECTOR: <selector>
+SEND_SELECTOR: <selector>
+RESPONSE_SELECTOR: <selector>
+
+HTML:
+{clean_html2[:30000]}"""
+                        answer2 = llm.call(messages=[{"role": "user", "content": prompt2}])
+                        if not isinstance(answer2, str):
+                            answer2 = str(answer2)
+                        print(f"[browser debug] Second LLM pass RAW ANSWER:\n{answer2[:1000]}")
+                        for line2 in answer2.strip().splitlines():
+                            if line2.startswith("INPUT_SELECTOR:") and "input" in still_missing:
+                                c = line2.split(":", 1)[1].strip()
+                                if _is_chat_input_selector(c):
+                                    detected["input"] = c
+                            elif line2.startswith("SEND_SELECTOR:") and "send" in still_missing:
+                                detected["send"] = line2.split(":", 1)[1].strip()
+                            elif line2.startswith("RESPONSE_SELECTOR:") and "response" in still_missing:
+                                c = line2.split(":", 1)[1].strip()
+                                if _is_chat_response_selector(c):
+                                    detected["response"] = c
+                        still_missing = [k for k in ("input", "send", "response") if k not in detected]
+                except Exception as launcher_err:
+                    print(f"[browser debug] Launcher click/re-scan failed: {launcher_err}")
+
         except Exception as e:
             from config.llm_config import MissingAPIKeyError
             if isinstance(e, MissingAPIKeyError):
@@ -335,9 +452,10 @@ HTML:
         }
         hints = "; ".join(f"'{k}' ({role_hints[k]})" for k in still_missing)
         raise BrowserAutoDetectError(
-            f"Auto-detection (heuristics + LLM fallback) could not identify selectors for: {hints} on '{url}'. "
-            f"Please open the page in Chrome, right-click each element → "
-            f"Inspect → copy the selector, and paste it into the form fields."
+            f"Auto-detection (heuristics + LLM fallback) could not identify selectors for: {hints} on '{url}'. \n"
+            f"The LLM may have seen dashboard/filter elements instead of chat elements.\n"
+            f"SOLUTION: Open the chatbot in Chrome → right-click each element → Inspect → copy the selector "
+            f"and paste it into the form's input_selector / send_selector / response_selector fields."
         )
 
     _SELECTOR_CACHE[key] = detected
@@ -697,12 +815,28 @@ def _query_in_frames(page: Any, sel: str) -> Any:
 
 
 def _ensure_visible_sel(sel: str) -> str:
-    """Fix strict-mode/ambiguity timeouts: if a selector matches multiple elements
-    but the first one is hidden, Playwright hangs. We explicitly ask for the
-    first VISIBLE match unless the user already provided complex combinators.
+    """For INPUT and SEND selectors: if multiple elements match, take the first visible one.
+    Prevents strict-mode timeouts when hidden variants (e.g. mobile layout) come first.
     """
     if "visible=" not in sel.lower() and "nth=" not in sel.lower():
         return f"{sel} >> visible=true >> nth=0"
+    return sel
+
+
+def _ensure_visible_response_sel(sel: str) -> str:
+    """For RESPONSE selectors: ensure visibility but do NOT pin to nth=0.
+    Chat responses are appended to the END of a list — pinning to nth=0
+    always watches the *first* message (which never changes after the
+    first round) instead of the *latest* bot reply.
+
+    We strip any existing `>> nth=N` suffix so auto-detected selectors
+    that already embed `:last-child` work without a conflicting nth pin.
+    """
+    import re as _re
+    # Remove any trailing >> nth=N the caller may have added
+    sel = _re.sub(r"\s*>>\s*nth=\d+", "", sel).strip()
+    if "visible=" not in sel.lower():
+        return f"{sel} >> visible=true"
     return sel
 
 def _wait_for_selector_with_frames(
@@ -988,29 +1122,19 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
             input_sel = config.input_selector.strip() or detected["input"]
             send_sel = config.send_selector.strip() or detected["send"]
             response_sel = config.response_selector.strip() or detected["response"]
-            
-            # If the LLM fallback noticed a chat launcher was necessary but the user
-            # hadn't explicitly configured one, we dynamically click it here BEFORE
-            # trying to interact with the input (otherwise the input remains hidden!)
-            detected_launcher = detected.get("launcher")
-            if detected_launcher and not config.chat_launcher_selector:
-                try:
-                    llm_launcher_locator = _wait_for_selector_with_frames(
-                        page, detected_launcher, timeout_ms, state="visible"
-                    )
-                    llm_launcher_locator.click()
-                    page.wait_for_timeout(500)
-                except Exception as e:  # noqa: BLE001
-                    print(f"[browser debug] LLM-detected launcher '{detected_launcher}' failed: {e}")
+            # NOTE: auto_detect_selectors now handles the launcher click + re-detection
+            # internally, so we don't need to click it here again.
         else:
             input_sel = config.input_selector
             send_sel = config.send_selector
             response_sel = config.response_selector
 
-        # Ensure all selectors are strictly visibility-filtered to fix query_selector mismatches
+        # Apply visibility filters:
+        # INPUT + SEND: use nth=0 (first visible) to handle hidden duplicate elements (e.g. mobile layout variants)
+        # RESPONSE: do NOT use nth=0 — chatbot responses are appended at the END, so we must watch the last one
         input_sel = _ensure_visible_sel(input_sel)
         send_sel = _ensure_visible_sel(send_sel)
-        response_sel = _ensure_visible_sel(response_sel)
+        response_sel = _ensure_visible_response_sel(response_sel)
 
         # Wait for input element
         try:
@@ -1028,8 +1152,16 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
         existing_response_text = ""
         try:
             if config.wait_strategy == "text_change":
-                el = page.query_selector(response_sel) or _query_in_frames(page, response_sel)
-                existing_response_text = el.inner_text() if el else ""
+                # Snapshot the LAST visible element — chat UIs append at the bottom
+                loc = page.locator(response_sel)
+                cnt = loc.count()
+                el_snap = loc.last if cnt > 0 else (page.query_selector(response_sel) or _query_in_frames(page, response_sel))
+                existing_response_text = ""
+                if el_snap:
+                    try:
+                        existing_response_text = el_snap.inner_text() or ""
+                    except Exception:  # noqa: BLE001
+                        existing_response_text = ""
             elif config.wait_strategy == "new_element":
                 try:
                     page.locator(response_sel).evaluate("el => { window._evalmind_last_node = el; }")
@@ -1155,9 +1287,21 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
             stable_since: Optional[float] = None
             while time.perf_counter() < deadline:
                 try:
-                    el = page.query_selector(response_sel) or _query_in_frames(page, response_sel)
-                    if el:
-                        text = el.inner_text()
+                    # IMPORTANT: use .last, not .first or query_selector (which returns the first DOM match).
+                    # Chat UIs append new responses at the END of the message list.
+                    # Watching the first match means we're always looking at the oldest message,
+                    # which never changes after the first round.
+                    locator = page.locator(response_sel)
+                    count = locator.count()
+                    el_handle = locator.last if count > 0 else None
+                    if el_handle is None:
+                        # Try child frames as fallback
+                        el_handle = _query_in_frames(page, response_sel)
+                    if el_handle:
+                        try:
+                            text = el_handle.inner_text()
+                        except Exception:  # noqa: BLE001
+                            text = ""
                         if text and text != existing_response_text:
                             if text != last_seen_text:
                                 last_seen_text = text
