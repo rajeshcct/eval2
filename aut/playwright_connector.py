@@ -363,71 +363,81 @@ HTML:
                     
             still_missing = [k for k in ("input", "send", "response") if k not in detected]
             
-            # ── Phase 2: if LLM found a launcher, click it then re-scan ──────
-            # The page we analyzed was the CLOSED state of the chat widget.
-            # We MUST click the launcher first, THEN re-run both heuristics
-            # AND a second LLM pass with the newly-visible chat HTML.
+            # ── Phase 2: if LLM found a launcher, click it then re-detect ALL selectors ──
+            # The selectors above were detected from the CLOSED-panel HTML.
+            # Elements like .ai-assistant-send-btn simply don't exist in the DOM
+            # until the panel is open — so we MUST re-detect everything from the
+            # live post-launcher HTML, not just the ones that were "still_missing".
             if detected.get("launcher"):
                 launcher_sel = detected["launcher"]
                 try:
                     page.locator(launcher_sel).first.click()
-                    page.wait_for_timeout(1500)  # let the panel fully mount
-                    print(f"[browser debug] Clicked LLM-detected launcher '{launcher_sel}', re-scanning for selectors...")
+                    page.wait_for_timeout(3000)  # wait generously for React/Vue panel to fully mount
+                    print(f"[browser debug] Clicked LLM-detected launcher '{launcher_sel}', re-scanning ALL selectors from open-panel HTML...")
                     
-                    # Re-run heuristics on the now-open panel
-                    if "input" in still_missing or not _is_chat_input_selector(detected.get("input", "")):
-                        re_inp = _find_first_matching(page, _INPUT_CANDIDATES)
-                        if re_inp:
-                            detected["input"] = re_inp
-                    if "send" in still_missing:
-                        re_snd = _find_first_matching(page, _SEND_CANDIDATES)
-                        if re_snd:
-                            detected["send"] = re_snd
-                    if "response" in still_missing:
-                        re_resp = _find_first_matching(page, _RESPONSE_CANDIDATES)
-                        if re_resp:
-                            detected["response"] = re_resp
+                    # Clear pre-launch selectors — they came from the closed DOM and may not exist now
+                    for k in ("input", "send", "response"):
+                        detected.pop(k, None)
+                    
+                    # Try fast heuristics first (free, no LLM call)
+                    re_inp = _find_first_matching(page, _INPUT_CANDIDATES)
+                    if re_inp:
+                        detected["input"] = re_inp
+                    re_snd = _find_first_matching(page, _SEND_CANDIDATES)
+                    if re_snd:
+                        detected["send"] = re_snd
+                    re_resp = _find_first_matching(page, _RESPONSE_CANDIDATES)
+                    if re_resp:
+                        detected["response"] = re_resp
                     
                     still_missing = [k for k in ("input", "send", "response") if k not in detected]
                     
-                    # If still missing, do a second LLM pass with the new post-launcher HTML
-                    if still_missing:
-                        print(f"[browser debug] Still missing {still_missing} after launcher click, running second LLM pass...")
-                        clean_html2 = page.evaluate('''() => {
-                            let clone = document.body.cloneNode(true);
-                            clone.querySelectorAll('script, style, svg, path, img, video, iframe, noscript').forEach(el => el.remove());
-                            return clone.innerHTML;
-                        }''')
-                        prompt2 = f"""You are a web automation expert. A chat panel has just been opened on {url}.
-The HTML below shows the OPEN chat widget. Find CSS selectors for: {still_missing}
+                    # Always do a second LLM pass with the open-panel HTML (even if
+                    # heuristics found something — the LLM may find better/more specific selectors
+                    # and override the generic heuristic ones where needed)
+                    print(f"[browser debug] Running LLM pass on open-panel HTML (still need: {still_missing or 'validation'})...")
+                    clean_html2 = page.evaluate('''() => {
+                        let clone = document.body.cloneNode(true);
+                        clone.querySelectorAll('script, style, svg, path, img, video, iframe, noscript').forEach(el => el.remove());
+                        return clone.innerHTML;
+                    }''')
+                    prompt2 = f"""You are a web automation expert. A chat panel has just been opened on {url}.
+The HTML below shows the OPEN chat widget. Find CSS selectors for these roles: ['input', 'send', 'response']
 
-CRITICAL: Only look for the CHAT elements — the text input where users TYPE messages,
-the SEND button that submits messages, and the container where BOT REPLIES appear.
-Do NOT suggest filter dropdowns, search bars, dashboard cards, or generic containers.
+CRITICAL RULES:
+1. 'input': The TEXT INPUT / TEXTAREA where the user TYPES their chat message. Must be an editable field.
+2. 'send': The SEND / SUBMIT button that POSTS the message. Look for buttons near the input.
+3. 'response': The container where BOT REPLIES appear. Pick the MOST SPECIFIC selector (class with 'message', 'reply', 'assistant', 'bot').
+4. DO NOT suggest filter dropdowns, search bars, dashboard cards, or navigation buttons.
+5. The selector MUST match an element that EXISTS in the HTML below.
 
-Respond ONLY in this exact format:
+Respond ONLY in this exact format (all three lines required):
 INPUT_SELECTOR: <selector>
 SEND_SELECTOR: <selector>
 RESPONSE_SELECTOR: <selector>
 
 HTML:
 {clean_html2[:30000]}"""
-                        answer2 = llm.call(messages=[{"role": "user", "content": prompt2}])
-                        if not isinstance(answer2, str):
-                            answer2 = str(answer2)
-                        print(f"[browser debug] Second LLM pass RAW ANSWER:\n{answer2[:1000]}")
-                        for line2 in answer2.strip().splitlines():
-                            if line2.startswith("INPUT_SELECTOR:") and "input" in still_missing:
-                                c = line2.split(":", 1)[1].strip()
-                                if _is_chat_input_selector(c):
-                                    detected["input"] = c
-                            elif line2.startswith("SEND_SELECTOR:") and "send" in still_missing:
-                                detected["send"] = line2.split(":", 1)[1].strip()
-                            elif line2.startswith("RESPONSE_SELECTOR:") and "response" in still_missing:
-                                c = line2.split(":", 1)[1].strip()
-                                if _is_chat_response_selector(c):
-                                    detected["response"] = c
-                        still_missing = [k for k in ("input", "send", "response") if k not in detected]
+                    answer2 = llm.call(messages=[{"role": "user", "content": prompt2}])
+                    if not isinstance(answer2, str):
+                        answer2 = str(answer2)
+                    print(f"[browser debug] Open-panel LLM pass RAW ANSWER:\n{answer2[:1000]}")
+                    for line2 in answer2.strip().splitlines():
+                        if line2.startswith("INPUT_SELECTOR:"):
+                            c = line2.split(":", 1)[1].strip()
+                            if _is_chat_input_selector(c):
+                                detected["input"] = c
+                            else:
+                                print(f"[browser debug] Open-panel LLM INPUT '{c}' rejected — looks like dropdown/filter")
+                        elif line2.startswith("SEND_SELECTOR:"):
+                            detected["send"] = line2.split(":", 1)[1].strip()
+                        elif line2.startswith("RESPONSE_SELECTOR:"):
+                            c = line2.split(":", 1)[1].strip()
+                            if _is_chat_response_selector(c):
+                                detected["response"] = c
+                            else:
+                                print(f"[browser debug] Open-panel LLM RESPONSE '{c}' rejected — looks like generic container")
+                    still_missing = [k for k in ("input", "send", "response") if k not in detected]
                 except Exception as launcher_err:
                     print(f"[browser debug] Launcher click/re-scan failed: {launcher_err}")
 
