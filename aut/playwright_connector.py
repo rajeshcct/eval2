@@ -214,67 +214,22 @@ def _is_chat_send_selector(sel: str) -> bool:
     return not any(clue in s for clue in _NOT_CHAT_SEND_CLUES)
 
 
-# The two SEND heuristics generic enough to match something completely
-# unrelated to the chat widget (any lone <button type=submit> on the whole
-# page, or the last button in ANY <form>). A stray match from either one
-# used to be accepted outright, BEFORE the LLM fallback even ran (it only
-# runs for roles still missing after heuristics) — this is the single
-# biggest source of 'send click does nothing' failures.
-_GENERIC_SEND_PATTERNS = {"button[type='submit']", "form button:last-of-type"}
-
-
-def _shares_container(page: Any, sel_a: str, sel_b: str, max_ancestors: int = 6) -> bool:
-    """Best-effort check that two selectors resolve to elements sharing a
-    reasonably close common ancestor (i.e. both live inside the same chat
-    widget) rather than being unrelated parts of the page. Only used to
-    veto the two _GENERIC_SEND_PATTERNS above when they matched by
-    accident. Returns True (does not veto) on any evaluation error or
-    missing element, so this can never block a legitimate match."""
-    try:
-        return bool(page.evaluate(
-            """([selA, selB, maxUp]) => {
-                const a = document.querySelector(selA);
-                const b = document.querySelector(selB);
-                if (!a || !b) return true;
-                let node = a;
-                for (let i = 0; i <= maxUp; i++) {
-                    if (!node) break;
-                    if (node.contains(b)) return true;
-                    node = node.parentElement;
-                }
-                return false;
-            }""",
-            [sel_a, sel_b, max_ancestors],
-        ))
-    except Exception:  # noqa: BLE001
-        return True
-
-
-def _detect_heuristics(page: Any, detected: dict[str, str]) -> None:
-    """Run the INPUT/SEND/RESPONSE heuristics and write results into
-    `detected` in place. SEND now gets the same semantic-clue rejection
-    INPUT/RESPONSE already had, plus a container-proximity check for the
-    two overly generic SEND patterns — previously an unrelated
-    button[type=submit] elsewhere on the page (login/search/newsletter
-    form) could win the 'send' role by accident, and because that removed
-    'send' from still_missing, the LLM fallback was never even consulted
-    for it."""
-    inp = _find_first_matching(page, _INPUT_CANDIDATES)
-    if inp:
-        detected["input"] = inp
-
-    snd = _find_first_matching(page, _SEND_CANDIDATES)
-    if snd:
-        if not _is_chat_send_selector(snd):
-            print(f"[browser debug] Heuristic SEND candidate '{snd}' rejected — matches a non-send clue (regenerate/attach/mic/etc.)")
-        elif snd in _GENERIC_SEND_PATTERNS and "input" in detected and not _shares_container(page, detected["input"], snd):
-            print(f"[browser debug] Heuristic SEND candidate '{snd}' rejected — not in the same container as the input; likely an unrelated submit button elsewhere on the page")
-        else:
-            detected["send"] = snd
-
-    resp = _find_first_matching(page, _RESPONSE_CANDIDATES)
-    if resp:
-        detected["response"] = resp
+# Launcher candidates — floating "open chat" buttons that some widgets
+# require clicking before ANY of input/send/response exist in the DOM.
+_LAUNCHER_CANDIDATES = [
+    "[data-testid*='launcher']",
+    "[data-testid*='chat-toggle']",
+    "[data-testid*='chat-button']",
+    "[aria-label*='open chat' i]",
+    "[aria-label*='chat assistant' i]",
+    "[aria-label*='chat' i]",
+    "[class*='chat-launcher']",
+    "[class*='chat-widget-button']",
+    "[class*='chat-bubble']",
+    "[class*='launcher']",
+    "[id*='chat-launcher']",
+    "[id*='chat-widget-button']",
+]
 
 
 def _clean_selector(raw: str) -> str:
@@ -297,9 +252,7 @@ _SELECTOR_LINE_RE = re.compile(
 def _parse_selector_lines(answer: str) -> dict[str, str]:
     """Robustly parse 'ROLE_SELECTOR: value' lines out of an LLM answer.
     Tolerant of extra whitespace around the colon, lowercase role names,
-    and 'ROLE SELECTOR' (space instead of underscore) — the previous
-    line.startswith('SEND_SELECTOR:') check dropped the whole line on any
-    of these drifts."""
+    and 'ROLE SELECTOR' (space instead of underscore)."""
     out: dict[str, str] = {}
     for line in answer.strip().splitlines():
         m = _SELECTOR_LINE_RE.match(line)
@@ -323,34 +276,240 @@ def _selector_exists(page: Any, sel: str) -> bool:
         return False
 
 
-def _apply_llm_selectors(page: Any, answer: str, detected: dict[str, str],
-                          only_roles: Optional[set[str]] = None) -> None:
-    """Parse an LLM selector answer and merge validated results into
-    `detected`. Every role (including SEND, which previously had no
-    validation at all) is checked against its semantic-clue filter AND
-    verified to actually exist in the live DOM before being accepted."""
+def _find_scoped_send_candidate(page: Any, input_sel: str, candidates: list[str]) -> Optional[str]:
+    """Search SEND candidates only within a nearby ancestor of the input
+    element, instead of the whole page. Marks that ancestor with a
+    throwaway data attribute via a JS walk (climbs up to 5 levels,
+    stopping early at the nearest <form>), scopes the Playwright search to
+    it, then always removes the marker in a finally block. A candidate is
+    only accepted if it ALSO resolves to exactly one element against the
+    WHOLE page — downstream code (call_browser_aut) re-queries the
+    returned string as a plain, unscoped page.locator(sel), so a selector
+    that's unique inside the container but ambiguous globally would break
+    later. This is what actually stops an unrelated submit button
+    elsewhere on the page (login/search/newsletter form) from winning the
+    'send' role, rather than only rejecting it after the fact."""
+    try:
+        marked = page.evaluate(
+            """(sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return false;
+                let node = el;
+                for (let i = 0; i < 5; i++) {
+                    if (!node.parentElement) break;
+                    node = node.parentElement;
+                    if (node.tagName === 'FORM') break;
+                }
+                node.setAttribute('data-evalmind-scope', 'send-search');
+                return true;
+            }""",
+            input_sel,
+        )
+    except Exception:  # noqa: BLE001
+        marked = False
+
+    if not marked:
+        return None
+
+    try:
+        container = page.locator("[data-evalmind-scope='send-search']").first
+        for sel in candidates:
+            try:
+                scoped = container.locator(sel)
+                if scoped.count() != 1 or not scoped.first.is_visible():
+                    continue
+                if page.locator(sel).count() != 1:
+                    continue
+                return sel
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+    finally:
+        try:
+            page.evaluate("""() => {
+                const n = document.querySelector('[data-evalmind-scope="send-search"]');
+                if (n) n.removeAttribute('data-evalmind-scope');
+            }""")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _stripped_body_html(page: Any, max_chars: int = 30000) -> str:
+    """Full-page HTML with script/style/svg/media stripped, for the
+    LAUNCHER/INPUT/RESPONSE LLM fallbacks, which need to see wherever in
+    the page their target actually lives."""
+    try:
+        html = page.evaluate('''() => {
+            let clone = document.body.cloneNode(true);
+            clone.querySelectorAll('script, style, svg, path, img, video, iframe, noscript').forEach(el => el.remove());
+            return clone.innerHTML;
+        }''')
+        return html[:max_chars] if html else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _get_input_container_html(page: Any, input_sel: str, max_chars: int = 8000) -> str:
+    """Return the outerHTML of a small ancestor of the input element — the
+    smallest container that plausibly holds the whole message-compose row
+    (input + send button). Used to scope the SEND LLM fallback to a tiny,
+    directly-relevant fragment instead of the entire page: a focused
+    question over a few hundred bytes of genuinely relevant HTML is both
+    far more reliable and far cheaper than asking over a 30k-char page
+    dump. Climbs the same 5-levels/stop-at-<form> path as
+    _find_scoped_send_candidate. Falls back to the full stripped body on
+    any error."""
+    try:
+        html = page.evaluate(
+            """(sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return null;
+                let node = el;
+                for (let i = 0; i < 5; i++) {
+                    if (!node.parentElement) break;
+                    node = node.parentElement;
+                    if (node.tagName === 'FORM') break;
+                }
+                const clone = node.cloneNode(true);
+                clone.querySelectorAll('script, style, svg, path, img, video, iframe, noscript').forEach(e => e.remove());
+                return clone.outerHTML;
+            }""",
+            input_sel,
+        )
+        if html:
+            return html[:max_chars]
+    except Exception:  # noqa: BLE001
+        pass
+    return _stripped_body_html(page, max_chars=max_chars)
+
+
+def _get_llm_or_raise() -> Any:
+    """Thin wrapper so a missing API key surfaces one clear, actionable
+    error immediately instead of being silently swallowed step-by-step as
+    'no selector found' with no explanation of why."""
+    from config.llm_config import get_llm, MissingAPIKeyError
+    try:
+        return get_llm()
+    except MissingAPIKeyError as e:
+        raise BrowserAutoDetectError(
+            f"LLM fallback cannot run: no API key is configured. "
+            f"Set LLM_PROVIDER and the matching *_API_KEY in your .env file. "
+            f"Error: {e}\n\n"
+            f"WORKAROUND: Open the chatbot page in Chrome DevTools, right-click "
+            f"each element → Inspect → Copy selector, then paste them into the "
+            f"form's input_selector / send_selector / response_selector fields."
+        ) from e
+
+
+def _llm_find_one_selector(llm: Any, prompt: str, role: str, page: Any, validator) -> Optional[str]:
+    """Ask the LLM a SINGLE-PURPOSE question for exactly one selector
+    role, parse + validate the answer, and return it or None. Every
+    sequential detection step below is its own focused question — this is
+    the direct fix for the old design asking for 3-4 roles in one shot
+    against a page where most of them didn't even exist yet (launcher-
+    gated widgets) or weren't relevant (LAUNCHER on non-gated ones)."""
+    try:
+        answer = llm.call(messages=[{"role": "user", "content": prompt}])
+    except Exception as e:  # noqa: BLE001
+        print(f"[browser debug] LLM call for '{role}' failed: {e}")
+        return None
+    if not isinstance(answer, str):
+        answer = str(answer)
+    print(f"[browser debug] LLM {role.upper()} RAW ANSWER:\n{answer[:1000]}")
+
     parsed = _parse_selector_lines(answer)
+    candidate = parsed.get(role)
+    if not candidate:
+        print(f"[browser debug] LLM did not return a usable {role.upper()}_SELECTOR line")
+        return None
+    if not validator(candidate):
+        print(f"[browser debug] LLM {role.upper()}_SELECTOR '{candidate}' rejected — fails semantic check for role '{role}'")
+        return None
+    if not _selector_exists(page, candidate):
+        print(f"[browser debug] LLM {role.upper()}_SELECTOR '{candidate}' rejected — does not match any element in the live DOM (likely hallucinated)")
+        return None
+    return candidate
 
-    for role, validator in (
-        ("input", _is_chat_input_selector),
-        ("send", _is_chat_send_selector),
-        ("response", _is_chat_response_selector),
-    ):
-        if only_roles is not None and role not in only_roles:
-            continue
-        candidate = parsed.get(role)
-        if not candidate:
-            continue
-        if not validator(candidate):
-            print(f"[browser debug] LLM {role.upper()}_SELECTOR '{candidate}' rejected — fails semantic check for role '{role}'")
-            continue
-        if not _selector_exists(page, candidate):
-            print(f"[browser debug] LLM {role.upper()}_SELECTOR '{candidate}' rejected — does not match any element in the live DOM (likely hallucinated)")
-            continue
-        detected[role] = candidate
 
-    if only_roles is None and "launcher" in parsed:
-        detected["launcher"] = parsed["launcher"]
+def _detect_launcher_only(page: Any, url: str) -> Optional[str]:
+    """STEP: look for a floating 'open chat' button. Heuristics first,
+    then a single-purpose LLM call if those miss. Returning None is the
+    NORMAL, non-error outcome for a widget that's already inline on the
+    page with no launcher at all."""
+    heuristic = _find_first_matching(page, _LAUNCHER_CANDIDATES)
+    if heuristic:
+        return heuristic
+
+    llm = _get_llm_or_raise()
+    html = _stripped_body_html(page, max_chars=20000)
+    prompt = f"""You are a web automation expert. Below is the stripped HTML of a page at {url}.
+
+Is there a floating button, icon, or bubble whose job is to OPEN a chat/assistant panel (as opposed to a chat input that's already visible on the page)? If the chat is already open/visible and no such button is needed, answer None.
+
+Respond with EXACTLY one line:
+LAUNCHER_SELECTOR: <selector or None>
+
+HTML:
+{html}"""
+    return _llm_find_one_selector(llm, prompt, "launcher", page, lambda _sel: True)
+
+
+def _detect_input_only(page: Any, url: str) -> Optional[str]:
+    """STEP: single-purpose LLM fallback for the chat text input, used
+    only after the heuristic list AND (if applicable) a launcher click
+    have both already been tried."""
+    llm = _get_llm_or_raise()
+    html = _stripped_body_html(page)
+    prompt = f"""You are a web automation expert. Below is the stripped HTML of a chatbot UI at {url}.
+
+Find the CSS selector for the TEXT INPUT / TEXTAREA where a user TYPES their chat message. It must be an editable field — not a dropdown, filter, or search bar.
+
+Respond with EXACTLY one line:
+INPUT_SELECTOR: <selector>
+
+HTML:
+{html}"""
+    return _llm_find_one_selector(llm, prompt, "input", page, _is_chat_input_selector)
+
+
+def _detect_send_only(page: Any, url: str, input_sel: str) -> Optional[str]:
+    """STEP: detect the send button AFTER input is already known, scoped
+    to input's own container. Both the heuristic search and (if needed)
+    the HTML shown to the LLM are limited to that small fragment — not
+    the whole page."""
+    scoped = _find_scoped_send_candidate(page, input_sel, _SEND_CANDIDATES)
+    if scoped and _is_chat_send_selector(scoped):
+        return scoped
+
+    llm = _get_llm_or_raise()
+    html = _get_input_container_html(page, input_sel)
+    prompt = f"""You are a web automation expert. Below is a small HTML fragment containing the chat text input for a page at {url} (its selector is '{input_sel}').
+
+Find the CSS selector for the SEND / SUBMIT button that posts this message. It should be inside or very near this fragment. Do not pick a regenerate, attach, mic, or emoji button.
+
+Respond with EXACTLY one line:
+SEND_SELECTOR: <selector>
+
+HTML fragment:
+{html}"""
+    return _llm_find_one_selector(llm, prompt, "send", page, _is_chat_send_selector)
+
+
+def _detect_response_only(page: Any, url: str) -> Optional[str]:
+    """STEP: single-purpose LLM fallback for the bot-response container,
+    run last, against the final (post-launcher, if any) DOM."""
+    llm = _get_llm_or_raise()
+    html = _stripped_body_html(page)
+    prompt = f"""You are a web automation expert. Below is the stripped HTML of a chatbot UI at {url}.
+
+Find the CSS selector for the element that holds the BOT's reply messages (the latest one). Use :last-child or :last-of-type if it's a list. Do not pick a generic dashboard card, sidebar, or navbar.
+
+Respond with EXACTLY one line:
+RESPONSE_SELECTOR: <selector>
+
+HTML:
+{html}"""
+    return _llm_find_one_selector(llm, prompt, "response", page, _is_chat_response_selector)
 
 
 def _find_first_matching(page: Any, candidates: list[str]) -> Optional[str]:
@@ -434,17 +593,35 @@ def auto_detect_selectors(
     config: Any,
     timeout_ms: int = 5000,
 ) -> dict[str, str]:
-    """Auto-detect input / send / response selectors for a chat UI using
-    heuristics only (no LLM / vision model required).
+    """Auto-detect launcher / input / send / response selectors for a chat
+    UI — as a strict SEQUENCE, not one combined ask.
 
-    Tries ranked lists of common chat UI CSS patterns for each role.
-    First visible match wins. Results are cached on the config object so
-    detection only runs once per EvalMind session regardless of how many
-    rounds are evaluated.
+    Order, and why it's in this order:
+      1. INPUT    — try to find it directly, against the page as it loaded.
+      2. LAUNCHER — only looked for if step 1 found nothing. Some widgets
+                    mount NOTHING (no input, no send, no response) until a
+                    floating icon is clicked; if input isn't there yet,
+                    that's the likely explanation, so we look for and
+                    click whatever opens the panel, then retry INPUT
+                    against the now-open DOM.
+      3. SEND     — detected AFTER input is known, and scoped to input's
+                    own container: the heuristic search only looks inside
+                    that container, and if an LLM call is needed it's
+                    only ever shown that small fragment, not the whole
+                    page.
+      4. RESPONSE — detected last, against the final DOM.
 
-    If heuristics can't find a selector for a role, raises
-    BrowserAutoDetectError with a clear message telling the user which
-    selector to provide manually in the form.
+    This replaces the previous design, which asked ONE LLM call to find
+    input/send/response/launcher all AT ONCE from the CLOSED-panel HTML.
+    For a launcher-gated widget none of input/send/response exist in that
+    HTML yet, so the model was guessing at elements that genuinely weren't
+    there; for a non-gated widget it was still forced to answer a
+    LAUNCHER question that didn't apply; and SEND in particular had no
+    scoping at all, so a stray unrelated submit button anywhere on the
+    page could win the role. Doing this as an ordered sequence — where
+    each step only runs once the previous step's real DOM state is known,
+    and SEND is scoped to INPUT's own container — removes all three
+    problems at the source instead of patching around them afterwards.
 
     Args:
         page:       an open Playwright Page already at the chatbot URL.
@@ -455,149 +632,72 @@ def auto_detect_selectors(
         timeout_ms: how long to wait for JS to render before scanning.
 
     Returns:
-        dict with keys 'input', 'send', 'response' → CSS selector strings.
+        dict with keys 'input', 'send', 'response' (and 'launcher' if one
+        was needed) → CSS selector strings.
     """
     key = config.session_key
     if key in _SELECTOR_CACHE:
         return _SELECTOR_CACHE[key]
 
-    # Give dynamic / React / Vue UIs a moment to render
+    # Give dynamic / React / Vue UIs a moment to render before scanning.
     page.wait_for_timeout(timeout_ms)
 
     detected: dict[str, str] = {}
 
-    _detect_heuristics(page, detected)
+    # ---- Step 1 of 4: INPUT, as the page loaded ---------------------------
+    input_sel = _find_first_matching(page, _INPUT_CANDIDATES)
 
-    still_missing = [k for k in ("input", "send", "response") if k not in detected]
-    if still_missing:
-        print(f"[browser debug] Heuristics missed {still_missing}, falling back to LLM HTML analysis...")
-        try:
-            # Strip scripts, styles, SVGs etc to save tokens and isolate structure
-            clean_html = page.evaluate('''() => {
-                let clone = document.body.cloneNode(true);
-                clone.querySelectorAll('script, style, svg, path, img, video, iframe, noscript').forEach(el => el.remove());
-                // Strip massive base64 attributes or giant class lists if needed, but innerHTML is usually okay after stripping the above
-                return clone.innerHTML;
-            }''')
-            
-            from config.llm_config import get_llm
-            llm = get_llm()
-            
-            prompt = f"""You are a web automation expert finding CSS selectors for Playwright.
-Below is the stripped HTML of a chatbot UI at {url}.
-We still need CSS selectors for: {still_missing}
+    # ---- Step 2 of 4: LAUNCHER, only if input wasn't already there --------
+    if not input_sel:
+        print("[browser debug] No chat input visible yet — checking for a launcher button...")
+        launcher_sel = _detect_launcher_only(page, url)
+        if launcher_sel:
+            detected["launcher"] = launcher_sel
+            try:
+                page.locator(launcher_sel).first.click()
+                page.wait_for_timeout(3000)  # let the panel actually mount
+                print(f"[browser debug] Clicked launcher '{launcher_sel}', re-scanning for input...")
+            except Exception as launcher_err:  # noqa: BLE001
+                print(f"[browser debug] Launcher click failed: {launcher_err}")
+            input_sel = _find_first_matching(page, _INPUT_CANDIDATES)
+        else:
+            print("[browser debug] No launcher found — trying INPUT via LLM against the page as-is...")
+        if not input_sel:
+            input_sel = _detect_input_only(page, url)
 
-Identify the BEST, MOST UNIQUE CSS selector for each missing element.
-CRITICAL RULES:
-1. The selector MUST perfectly match an element that ACTUALLY EXISTS in the provided HTML.
-2. DO NOT output generic fallback selectors like 'textarea, input'. Look at the HTML and find the actual class, id, or data-testid.
-3. If it's a chat input, look for search bars, text inputs, or textareas that a user would type a message into.
-4. If it's a send button, look for buttons near the input, often with an icon or 'Send' text.
-5. If it's a response, look for the container holding the chatbot's messages. Use :last-child or :last-of-type if it's a list.
-6. If the chat input is hidden behind a 'chat widget' launcher button (e.g. a floating icon), provide its selector as well. If the chat is already open and visible without a launcher, return 'None' for LAUNCHER_SELECTOR.
-
-Respond in EXACTLY this format (one selector per line, no explanation, only for the missing ones):
-INPUT_SELECTOR: <selector>
-SEND_SELECTOR: <selector>
-RESPONSE_SELECTOR: <selector>
-LAUNCHER_SELECTOR: <selector or None>
-
-HTML:
-{clean_html[:30000]}"""
-
-            print(f"[browser debug] Calling LLM ({type(llm).__name__}) for selector detection...")
-            answer = llm.call(messages=[{"role": "user", "content": prompt}])
-            if not isinstance(answer, str):
-                answer = str(answer)
-            
-            print(f"[browser debug] LLM HTML fallback RAW ANSWER:\n{answer[:2000]}")
-                
-            _apply_llm_selectors(page, answer, detected)
-            still_missing = [k for k in ("input", "send", "response") if k not in detected]
-            
-            # ── Phase 2: if LLM found a launcher, click it then re-detect ALL selectors ──
-            # The selectors above were detected from the CLOSED-panel HTML.
-            # Elements like .ai-assistant-send-btn simply don't exist in the DOM
-            # until the panel is open — so we MUST re-detect everything from the
-            # live post-launcher HTML, not just the ones that were "still_missing".
-            if detected.get("launcher"):
-                launcher_sel = detected["launcher"]
-                try:
-                    page.locator(launcher_sel).first.click()
-                    page.wait_for_timeout(3000)  # wait generously for React/Vue panel to fully mount
-                    print(f"[browser debug] Clicked LLM-detected launcher '{launcher_sel}', re-scanning ALL selectors from open-panel HTML...")
-                    
-                    # Clear pre-launch selectors — they came from the closed DOM and may not exist now
-                    for k in ("input", "send", "response"):
-                        detected.pop(k, None)
-                    
-                    # Try fast heuristics first (free, no LLM call) — now
-                    # with the same SEND validation as the initial pass.
-                    _detect_heuristics(page, detected)
-                    
-                    still_missing = [k for k in ("input", "send", "response") if k not in detected]
-                    
-                    # Always do a second LLM pass with the open-panel HTML (even if
-                    # heuristics found something — the LLM may find better/more specific selectors
-                    # and override the generic heuristic ones where needed)
-                    print(f"[browser debug] Running LLM pass on open-panel HTML (still need: {still_missing or 'validation'})...")
-                    clean_html2 = page.evaluate('''() => {
-                        let clone = document.body.cloneNode(true);
-                        clone.querySelectorAll('script, style, svg, path, img, video, iframe, noscript').forEach(el => el.remove());
-                        return clone.innerHTML;
-                    }''')
-                    prompt2 = f"""You are a web automation expert. A chat panel has just been opened on {url}.
-The HTML below shows the OPEN chat widget. Find CSS selectors for these roles: ['input', 'send', 'response']
-
-CRITICAL RULES:
-1. 'input': The TEXT INPUT / TEXTAREA where the user TYPES their chat message. Must be an editable field.
-2. 'send': The SEND / SUBMIT button that POSTS the message. Look for buttons near the input.
-3. 'response': The container where BOT REPLIES appear. Pick the MOST SPECIFIC selector (class with 'message', 'reply', 'assistant', 'bot').
-4. DO NOT suggest filter dropdowns, search bars, dashboard cards, or navigation buttons.
-5. The selector MUST match an element that EXISTS in the HTML below.
-
-Respond ONLY in this exact format (all three lines required):
-INPUT_SELECTOR: <selector>
-SEND_SELECTOR: <selector>
-RESPONSE_SELECTOR: <selector>
-
-HTML:
-{clean_html2[:30000]}"""
-                    answer2 = llm.call(messages=[{"role": "user", "content": prompt2}])
-                    if not isinstance(answer2, str):
-                        answer2 = str(answer2)
-                    print(f"[browser debug] Open-panel LLM pass RAW ANSWER:\n{answer2[:1000]}")
-                    _apply_llm_selectors(page, answer2, detected, only_roles={"input", "send", "response"})
-                    still_missing = [k for k in ("input", "send", "response") if k not in detected]
-                except Exception as launcher_err:
-                    print(f"[browser debug] Launcher click/re-scan failed: {launcher_err}")
-
-        except Exception as e:
-            from config.llm_config import MissingAPIKeyError
-            if isinstance(e, MissingAPIKeyError):
-                raise BrowserAutoDetectError(
-                    f"LLM HTML fallback cannot run: no API key is configured. "
-                    f"Set LLM_PROVIDER and the matching *_API_KEY in your .env file. "
-                    f"Error: {e}\n\n"
-                    f"WORKAROUND: Open the chatbot page in Chrome DevTools, right-click "
-                    f"each element → Inspect → Copy selector, then paste them into the "
-                    f"form's input_selector / send_selector / response_selector fields."
-                ) from e
-            print(f"[browser debug] LLM HTML fallback failed: {e}")
-
-    if still_missing:
-        role_hints = {
-            "input":    "the chat text input / textarea",
-            "send":     "the Send / Submit button",
-            "response": "the element containing the bot's reply",
-        }
-        hints = "; ".join(f"'{k}' ({role_hints[k]})" for k in still_missing)
+    if not input_sel:
         raise BrowserAutoDetectError(
-            f"Auto-detection (heuristics + LLM fallback) could not identify selectors for: {hints} on '{url}'. \n"
-            f"The LLM may have seen dashboard/filter elements instead of chat elements.\n"
-            f"SOLUTION: Open the chatbot in Chrome → right-click each element → Inspect → copy the selector "
-            f"and paste it into the form's input_selector / send_selector / response_selector fields."
+            f"Auto-detection could not identify the chat text input on '{url}' "
+            f"(checked for a launcher button first, in case the widget was "
+            f"gated behind one). "
+            f"SOLUTION: Open the chatbot in Chrome → right-click the text input → "
+            f"Inspect → copy the selector and provide it as input_selector."
         )
+    detected["input"] = input_sel
+
+    # ---- Step 3 of 4: SEND, scoped to input's own container ---------------
+    send_sel = _detect_send_only(page, url, input_sel)
+    if not send_sel:
+        raise BrowserAutoDetectError(
+            f"Auto-detection found the chat input ('{input_sel}') but could not "
+            f"identify its send button on '{url}'. "
+            f"SOLUTION: Open the chatbot in Chrome → right-click the send button → "
+            f"Inspect → copy the selector and provide it as send_selector."
+        )
+    detected["send"] = send_sel
+
+    # ---- Step 4 of 4: RESPONSE ----------------------------------------------
+    response_sel = _find_first_matching(page, _RESPONSE_CANDIDATES)
+    if not response_sel:
+        response_sel = _detect_response_only(page, url)
+    if not response_sel:
+        raise BrowserAutoDetectError(
+            f"Auto-detection found input ('{input_sel}') and send ('{send_sel}') "
+            f"but could not identify the bot-response container on '{url}'. "
+            f"SOLUTION: Open the chatbot in Chrome → right-click a bot reply → "
+            f"Inspect → copy the selector and provide it as response_selector."
+        )
+    detected["response"] = response_sel
 
     _SELECTOR_CACHE[key] = detected
     return detected
