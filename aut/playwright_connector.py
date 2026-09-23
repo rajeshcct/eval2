@@ -44,11 +44,13 @@ Error handling:
 from __future__ import annotations
 
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from aut.connector import AUTConnectorError, AUTResponse
+from progress import emit_event
 
 
 # ==========================================================================
@@ -69,6 +71,18 @@ class BrowserSelectorError(AUTConnectorError):
 
 class BrowserAutoDetectError(AUTConnectorError):
     """Auto-detection of selectors failed even after heuristics + LLM vision."""
+
+
+# Selector-detection LLM calls get their own short, fail-fast timeout and a
+# hard wall-clock budget for the whole auto_detect_selectors() sequence —
+# previously neither existed: the LLM call itself had no timeout (falling
+# back to whatever the provider SDK defaults to, commonly minutes), and
+# nothing capped how long the up-to-4-step chained sequence could run in
+# total. A slow/rate-limited response on any one step used to be
+# indistinguishable, from the caller's side, from a genuine hang.
+SELECTOR_DETECT_TIMEOUT_SECONDS = 20.0
+SELECTOR_DETECT_MAX_TOKENS = 300
+AUTO_DETECT_BUDGET_SECONDS = 55.0
 
 
 # ==========================================================================
@@ -265,6 +279,41 @@ def _parse_selector_lines(answer: str) -> dict[str, str]:
     return out
 
 
+def _has_top_level_comma(sel: str) -> bool:
+    """True if `sel` contains a comma OUTSIDE of [...] attribute brackets
+    and outside of quoted strings — i.e. it's a genuine CSS selector LIST
+    ('a, b') rather than a single selector whose own syntax happens to
+    contain a comma (e.g. an attribute value like [data-foo="a,b"]).
+
+    An LLM-returned selector list is a real, previously-unguarded failure
+    mode: nothing forbade the model from hedging with 'textarea,
+    input[placeholder*="message" i]', and _selector_exists() accepted it
+    outright (a comma-list matching 1+ elements TOTAL across ALL its
+    alternatives passes page.locator(sel).count() >= 1 just as happily as
+    a genuine single-element selector). The final `>> nth=0` suffix
+    _ensure_visible_sel applies later then picks whichever alternative
+    happens to come first in DOCUMENT ORDER — not necessarily the one the
+    model actually meant — so 'exists' silently stopped meaning 'resolves
+    to the right element'.
+    """
+    depth = 0
+    in_quote: Optional[str] = None
+    for ch in sel:
+        if in_quote:
+            if ch == in_quote:
+                in_quote = None
+            continue
+        if ch in ("'", '"'):
+            in_quote = ch
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            return True
+    return False
+
+
 def _selector_exists(page: Any, sel: str) -> bool:
     """Best-effort check that `sel` currently resolves to at least one
     element in the live DOM. An LLM-sourced selector previously had NO
@@ -274,6 +323,39 @@ def _selector_exists(page: Any, sel: str) -> bool:
         return page.locator(sel).count() >= 1
     except Exception:  # noqa: BLE001
         return False
+
+
+def _cached_selectors_still_valid(page: Any, cached: dict[str, str]) -> bool:
+    """Cheap re-validation of a previously-cached selector set against the
+    CURRENT live DOM, before trusting it for another round.
+
+    A selector cached from an earlier round can go stale if the chat
+    widget's DOM changes mid-session (an SPA re-render after a client-side
+    route change, an A/B-tested markup swap, a modal that gets torn down
+    and rebuilt with new attributes). Previously the cache was never
+    invalidated or re-checked: a stale entry sailed straight through
+    auto_detect_selectors() and only failed much later, downstream, after
+    _wait_for_selector_with_frames() burned the FULL wait_timeout_seconds
+    waiting on a selector that was never going to appear — and (before the
+    retry fix in aut/connector.py::call_aut_with_retry) that failure took
+    down the whole session rather than just that one round.
+
+    Only 'input' and 'send' (the two interaction targets) and 'response'
+    are checked — 'launcher' is deliberately excluded: it's a one-time
+    toggle, and a widget commonly hides or repurposes that element once
+    the panel is already open, so its absence on a later round is expected
+    behavior, not staleness. This only asks "does the selector resolve to
+    at least one element" (via the same _selector_exists check LLM
+    candidates are validated with), never "does it currently have text" —
+    a momentarily-empty response container between rounds is normal.
+    """
+    for role in ("input", "send", "response"):
+        sel = cached.get(role)
+        if not sel:
+            continue
+        if not _selector_exists(page, sel):
+            return False
+    return True
 
 
 def _find_scoped_send_candidate(page: Any, input_sel: str, candidates: list[str]) -> Optional[str]:
@@ -316,8 +398,20 @@ def _find_scoped_send_candidate(page: Any, input_sel: str, candidates: list[str]
         for sel in candidates:
             try:
                 scoped = container.locator(sel)
-                if scoped.count() != 1 or not scoped.first.is_visible():
+                scoped_count = scoped.count()
+                if scoped_count == 0:
                     continue
+                if scoped_count == 1:
+                    if not scoped.first.is_visible():
+                        continue
+                else:
+                    # 2+ matches within the scoped container — same
+                    # visible-only re-check as _find_first_matching, rather
+                    # than discarding the candidate outright (a hidden
+                    # duplicate inside the same compose row is common).
+                    visible_scoped = container.locator(f"{sel} >> visible=true")
+                    if visible_scoped.count() != 1:
+                        continue
                 if page.locator(sel).count() != 1:
                     continue
                 return sel
@@ -386,10 +480,22 @@ def _get_input_container_html(page: Any, input_sel: str, max_chars: int = 8000) 
 def _get_llm_or_raise() -> Any:
     """Thin wrapper so a missing API key surfaces one clear, actionable
     error immediately instead of being silently swallowed step-by-step as
-    'no selector found' with no explanation of why."""
+    'no selector found' with no explanation of why.
+
+    Uses role="selector_detect" (its own model slot — see
+    config/llm_config.py's VALID_ROLES — falling back to the provider's
+    plain model if that role has no override configured), with a short
+    fail-fast timeout and a small max_tokens cap: the expected answer is
+    one short line, and this call must never be the thing that hangs an
+    entire browser session.
+    """
     from config.llm_config import get_llm, MissingAPIKeyError
     try:
-        return get_llm()
+        return get_llm(
+            role="selector_detect",
+            timeout=SELECTOR_DETECT_TIMEOUT_SECONDS,
+            max_tokens=SELECTOR_DETECT_MAX_TOKENS,
+        )
     except MissingAPIKeyError as e:
         raise BrowserAutoDetectError(
             f"LLM fallback cannot run: no API key is configured. "
@@ -401,13 +507,22 @@ def _get_llm_or_raise() -> Any:
         ) from e
 
 
-def _llm_find_one_selector(llm: Any, prompt: str, role: str, page: Any, validator) -> Optional[str]:
-    """Ask the LLM a SINGLE-PURPOSE question for exactly one selector
-    role, parse + validate the answer, and return it or None. Every
-    sequential detection step below is its own focused question — this is
-    the direct fix for the old design asking for 3-4 roles in one shot
-    against a page where most of them didn't even exist yet (launcher-
-    gated widgets) or weren't relevant (LAUNCHER on non-gated ones)."""
+def _llm_ask_selector(llm: Any, prompt: str, role: str) -> Optional[str]:
+    """Ask the LLM a SINGLE-PURPOSE question for exactly one selector role
+    and return the parsed, comma-list-rejected candidate — or None.
+
+    Deliberately does NOT touch the Playwright `page` object anywhere in
+    this function: it's the page-independent half of what used to be one
+    monolithic _llm_find_one_selector(), split out specifically so it's
+    safe to run on a background thread (see _start_response_llm_job below)
+    concurrently with another step that DOES need page access — Playwright's
+    synchronous API is not safe to touch from two threads at once, but a
+    plain LLM HTTP call + string parsing has no such restriction. The
+    caller is responsible for the remaining page-touching validation
+    (a semantic validator + _selector_exists) on whichever thread is
+    allowed to touch `page` — see _llm_find_one_selector for the
+    synchronous, single-thread version of that full sequence.
+    """
     try:
         answer = llm.call(messages=[{"role": "user", "content": prompt}])
     except Exception as e:  # noqa: BLE001
@@ -422,6 +537,26 @@ def _llm_find_one_selector(llm: Any, prompt: str, role: str, page: Any, validato
     if not candidate:
         print(f"[browser debug] LLM did not return a usable {role.upper()}_SELECTOR line")
         return None
+    if _has_top_level_comma(candidate):
+        print(
+            f"[browser debug] LLM {role.upper()}_SELECTOR '{candidate}' rejected — "
+            f"it's a comma-separated selector LIST, not a single selector "
+            f"(ambiguous which alternative it actually means)"
+        )
+        return None
+    return candidate
+
+
+def _validate_llm_selector(candidate: Optional[str], role: str, page: Any, validator) -> Optional[str]:
+    """The page-touching half of the old _llm_find_one_selector: given a
+    candidate already parsed and comma-checked by _llm_ask_selector (on
+    whichever thread produced it), run the semantic validator and the live-
+    DOM existence check — both of which need `page` — on the CALLING
+    thread. Must only ever be invoked from the single thread that's allowed
+    to touch `page` (the main auto-detection thread), never from inside a
+    background job's worker function."""
+    if candidate is None:
+        return None
     if not validator(candidate):
         print(f"[browser debug] LLM {role.upper()}_SELECTOR '{candidate}' rejected — fails semantic check for role '{role}'")
         return None
@@ -429,6 +564,90 @@ def _llm_find_one_selector(llm: Any, prompt: str, role: str, page: Any, validato
         print(f"[browser debug] LLM {role.upper()}_SELECTOR '{candidate}' rejected — does not match any element in the live DOM (likely hallucinated)")
         return None
     return candidate
+
+
+def _llm_find_one_selector(llm: Any, prompt: str, role: str, page: Any, validator) -> Optional[str]:
+    """Ask the LLM a SINGLE-PURPOSE question for exactly one selector
+    role, parse + validate the answer, and return it or None. Every
+    sequential detection step below is its own focused question — this is
+    the direct fix for the old design asking for 3-4 roles in one shot
+    against a page where most of them didn't even exist yet (launcher-
+    gated widgets) or weren't relevant (LAUNCHER on non-gated ones).
+
+    Synchronous convenience wrapper around _llm_ask_selector() +
+    _validate_llm_selector() for the three roles (launcher/input/send)
+    that are never run concurrently with anything else. RESPONSE detection
+    uses the two halves directly instead — see _start_response_llm_job.
+    """
+    candidate = _llm_ask_selector(llm, prompt, role)
+    return _validate_llm_selector(candidate, role, page, validator)
+
+
+@dataclass
+class _ResponseDetectJob:
+    """A RESPONSE-selector LLM lookup running on a background thread,
+    started as soon as INPUT is known — RESPONSE doesn't depend on INPUT's
+    resolved value or on SEND at all, only on the DOM already being in its
+    final, post-launcher-click state, which is already true by the time
+    INPUT is resolved. The worker thread (see _start_response_llm_job)
+    calls ONLY _llm_ask_selector() — the page-independent half — so it
+    never touches Playwright's `page` object while the main thread goes on
+    to run SEND detection, which does need page access.
+
+    Call join() from the main thread, after SEND detection is done, to get
+    the raw (comma-checked but not yet page-validated) candidate or None.
+    The caller must still run _validate_llm_selector() against the live
+    page afterwards, on the main thread — exactly the same validation any
+    other LLM candidate in this file gets, just deferred past the join.
+    """
+
+    thread: threading.Thread
+    _result: list  # single-element box populated by the worker: [candidate_or_None]
+
+    def join(self, timeout: Optional[float] = None) -> Optional[str]:
+        self.thread.join(timeout=timeout)
+        if self.thread.is_alive():
+            # The LLM call still hasn't returned even after SEND detection
+            # finished and any extra grace period elapsed — extremely
+            # unlikely given SELECTOR_DETECT_TIMEOUT_SECONDS, but don't
+            # block the caller forever waiting on a daemon thread.
+            print("[browser debug] RESPONSE background LLM job still running — not waiting further")
+            return None
+        return self._result[0] if self._result else None
+
+
+def _start_response_llm_job(llm: Any, html: str, url: str) -> _ResponseDetectJob:
+    """Schedule the RESPONSE LLM lookup on a background thread so it runs
+    concurrently with SEND detection instead of strictly after it. `html`
+    must already be captured by the CALLER on the main thread (a
+    page.evaluate() call) — the worker below performs ONLY the LLM HTTP
+    call and string parsing via _llm_ask_selector(), no Playwright access
+    of any kind."""
+    prompt = f"""You are a web automation expert. Below is the stripped HTML of a chatbot UI at {url}.
+
+Find the CSS selector for the element that holds the BOT's reply messages (the latest one). Use :last-child or :last-of-type if it's a list. Do not pick a generic dashboard card, sidebar, or navbar.
+
+Give exactly ONE CSS selector — never a comma-separated list of alternatives.
+
+Respond with EXACTLY one line:
+RESPONSE_SELECTOR: <selector>
+
+HTML:
+{html}"""
+
+    box: list = []
+
+    def _worker() -> None:
+        try:
+            candidate = _llm_ask_selector(llm, prompt, "response")
+        except Exception as e:  # noqa: BLE001 - a background thread must never raise uncaught
+            print(f"[browser debug] RESPONSE background LLM job raised: {e}")
+            candidate = None
+        box.append(candidate)
+
+    t = threading.Thread(target=_worker, daemon=True, name="response-selector-detect")
+    t.start()
+    return _ResponseDetectJob(thread=t, _result=box)
 
 
 def _detect_launcher_only(page: Any, url: str) -> Optional[str]:
@@ -445,6 +664,8 @@ def _detect_launcher_only(page: Any, url: str) -> Optional[str]:
     prompt = f"""You are a web automation expert. Below is the stripped HTML of a page at {url}.
 
 Is there a floating button, icon, or bubble whose job is to OPEN a chat/assistant panel (as opposed to a chat input that's already visible on the page)? If the chat is already open/visible and no such button is needed, answer None.
+
+Give exactly ONE CSS selector — never a comma-separated list of alternatives.
 
 Respond with EXACTLY one line:
 LAUNCHER_SELECTOR: <selector or None>
@@ -463,6 +684,8 @@ def _detect_input_only(page: Any, url: str) -> Optional[str]:
     prompt = f"""You are a web automation expert. Below is the stripped HTML of a chatbot UI at {url}.
 
 Find the CSS selector for the TEXT INPUT / TEXTAREA where a user TYPES their chat message. It must be an editable field — not a dropdown, filter, or search bar.
+
+Give exactly ONE CSS selector — never a comma-separated list of alternatives.
 
 Respond with EXACTLY one line:
 INPUT_SELECTOR: <selector>
@@ -487,6 +710,8 @@ def _detect_send_only(page: Any, url: str, input_sel: str) -> Optional[str]:
 
 Find the CSS selector for the SEND / SUBMIT button that posts this message. It should be inside or very near this fragment. Do not pick a regenerate, attach, mic, or emoji button.
 
+Give exactly ONE CSS selector — never a comma-separated list of alternatives.
+
 Respond with EXACTLY one line:
 SEND_SELECTOR: <selector>
 
@@ -504,6 +729,8 @@ def _detect_response_only(page: Any, url: str) -> Optional[str]:
 
 Find the CSS selector for the element that holds the BOT's reply messages (the latest one). Use :last-child or :last-of-type if it's a list. Do not pick a generic dashboard card, sidebar, or navbar.
 
+Give exactly ONE CSS selector — never a comma-separated list of alternatives.
+
 Respond with EXACTLY one line:
 RESPONSE_SELECTOR: <selector>
 
@@ -514,7 +741,7 @@ HTML:
 
 def _find_first_matching(page: Any, candidates: list[str]) -> Optional[str]:
     """Return the first selector in candidates that resolves to EXACTLY ONE
-    visible element.
+    VISIBLE element.
 
     Previously this used page.query_selector(), which returns the first DOM
     match with no multiplicity check — a selector could "pass" detection
@@ -525,13 +752,37 @@ def _find_first_matching(page: Any, candidates: list[str]) -> Optional[str]:
     real source of "the field is right there in the screenshot but the fill
     failed" failures. Using locator().count() == 1 here means "detected as
     usable" and "actually usable by fill()/click()" are the same check, so
-    a selector matching 2+ elements is skipped (not guessed at) rather than
-    silently deferring a strict-mode violation to a later step.
+    a selector matching 2+ RAW DOM elements is never guessed at.
+
+    A raw count of 2+ is NOT an automatic skip, though: real chat widgets
+    very commonly render a hidden duplicate alongside the real field (a
+    mobile-layout variant, a visually-hidden shadow/autosize textarea, a
+    second unrelated element sharing a loose attribute selector).
+    Discarding the selector outright the moment ANY duplicate exists — even
+    when exactly one of those matches is actually visible — used to push
+    detection to fall through to the slow, LLM-dependent fallback far more
+    often than the DOM genuinely required. So when the raw count is 2+,
+    this re-counts against `sel >> visible=true` specifically (the same
+    idiom _ensure_visible_sel below already applies to a selector AFTER
+    detection succeeds) and accepts the selector if exactly one VISIBLE
+    match remains — "detected as usable" still means "the same check
+    fill()/click() will see", just against the visible-only count rather
+    than the raw one.
     """
     for sel in candidates:
         try:
             locator = page.locator(sel)
-            if locator.count() == 1 and locator.first.is_visible():
+            count = locator.count()
+            if count == 0:
+                continue
+            if count == 1:
+                if locator.first.is_visible():
+                    return sel
+                continue
+            # 2+ raw DOM matches — re-check against visible-only elements
+            # before giving up on this candidate.
+            visible_locator = page.locator(f"{sel} >> visible=true")
+            if visible_locator.count() == 1:
                 return sel
         except Exception:  # noqa: BLE001
             continue
@@ -592,6 +843,7 @@ def auto_detect_selectors(
     url: str,
     config: Any,
     timeout_ms: int = 5000,
+    on_event: Optional[Any] = None,
 ) -> dict[str, str]:
     """Auto-detect launcher / input / send / response selectors for a chat
     UI — as a strict SEQUENCE, not one combined ask.
@@ -609,7 +861,18 @@ def auto_detect_selectors(
                     that container, and if an LLM call is needed it's
                     only ever shown that small fragment, not the whole
                     page.
-      4. RESPONSE — detected last, against the final DOM.
+      4. RESPONSE — heuristic scan runs right after INPUT is known (it
+                    doesn't depend on INPUT's value or on SEND at all).
+                    If that heuristic misses, the LLM fallback is kicked
+                    off on a BACKGROUND THREAD at that point and runs
+                    CONCURRENTLY with step 3 (SEND) below, instead of
+                    waiting for SEND to finish first — the two LLM calls
+                    that used to always run strictly one after another now
+                    overlap. The main thread joins that background job
+                    right after SEND detection completes. See
+                    _start_response_llm_job / _ResponseDetectJob for how
+                    this stays safe with Playwright's sync API (the
+                    background thread never touches `page`).
 
     This replaces the previous design, which asked ONE LLM call to find
     input/send/response/launcher all AT ONCE from the CLOSED-panel HTML.
@@ -623,6 +886,19 @@ def auto_detect_selectors(
     and SEND is scoped to INPUT's own container — removes all three
     problems at the source instead of patching around them afterwards.
 
+    A hard wall-clock budget (AUTO_DETECT_BUDGET_SECONDS) covers the WHOLE
+    sequence: each LLM call already has its own short fail-fast timeout
+    (see _get_llm_or_raise), but a slow provider response on one step used
+    to be indistinguishable, from the caller's side, from a genuine hang.
+    Exceeding the budget raises a clean BrowserAutoDetectError naming which
+    step it was in, instead of running long in a way nothing bounds.
+
+    A previously-cached selector set for this session is re-validated
+    against the LIVE page (see _cached_selectors_still_valid) before being
+    trusted — a stale cache entry (DOM changed mid-session) is evicted and
+    detection re-run, rather than being returned as-is and only failing
+    much later, downstream, after burning the full wait_timeout_seconds.
+
     Args:
         page:       an open Playwright Page already at the chatbot URL.
         url:        the chatbot URL (used in error messages for context).
@@ -630,14 +906,41 @@ def auto_detect_selectors(
                     stable session_key, not id() — see that field's
                     docstring in aut/connector.py).
         timeout_ms: how long to wait for JS to render before scanning.
+        on_event:   optional progress callback (progress.OnEvent). Fires
+                    "selector_detection_step" at the start of each major
+                    step so a live UI can show real activity ("checking
+                    for a launcher button…") instead of going silent for
+                    however long detection takes. None (the default) is a
+                    no-op.
 
     Returns:
         dict with keys 'input', 'send', 'response' (and 'launcher' if one
         was needed) → CSS selector strings.
     """
     key = config.session_key
-    if key in _SELECTOR_CACHE:
-        return _SELECTOR_CACHE[key]
+    cached = _SELECTOR_CACHE.get(key)
+    if cached is not None:
+        if _cached_selectors_still_valid(page, cached):
+            return cached
+        print(
+            "[browser debug] Cached selectors for this session no longer "
+            "resolve on the live page (likely a DOM change since an earlier "
+            "round) — evicting cache and re-running detection."
+        )
+        del _SELECTOR_CACHE[key]
+
+    deadline = time.perf_counter() + AUTO_DETECT_BUDGET_SECONDS
+
+    def _check_budget(step_label: str) -> None:
+        if time.perf_counter() > deadline:
+            raise BrowserAutoDetectError(
+                f"Auto-detection exceeded its {AUTO_DETECT_BUDGET_SECONDS:.0f}s "
+                f"wall-clock budget while working on '{step_label}' for '{url}'. "
+                f"This is usually a slow or rate-limited LLM provider response, "
+                f"not a genuinely missing element. SOLUTION: provide "
+                f"input_selector/send_selector/response_selector manually to "
+                f"skip auto-detection entirely, or retry the run."
+            )
 
     # Give dynamic / React / Vue UIs a moment to render before scanning.
     page.wait_for_timeout(timeout_ms)
@@ -645,12 +948,16 @@ def auto_detect_selectors(
     detected: dict[str, str] = {}
 
     # ---- Step 1 of 4: INPUT, as the page loaded ---------------------------
+    emit_event(on_event, "selector_detection_step", {"step": "input", "message": "Looking for the chat input..."})
     input_sel = _find_first_matching(page, _INPUT_CANDIDATES)
+    _check_budget("input detection")
 
     # ---- Step 2 of 4: LAUNCHER, only if input wasn't already there --------
     if not input_sel:
         print("[browser debug] No chat input visible yet — checking for a launcher button...")
+        emit_event(on_event, "selector_detection_step", {"step": "launcher", "message": "Checking for a launcher button..."})
         launcher_sel = _detect_launcher_only(page, url)
+        _check_budget("launcher detection")
         if launcher_sel:
             detected["launcher"] = launcher_sel
             try:
@@ -663,7 +970,9 @@ def auto_detect_selectors(
         else:
             print("[browser debug] No launcher found — trying INPUT via LLM against the page as-is...")
         if not input_sel:
+            emit_event(on_event, "selector_detection_step", {"step": "input_llm", "message": "Asking the model to find the input..."})
             input_sel = _detect_input_only(page, url)
+            _check_budget("input detection (LLM)")
 
     if not input_sel:
         raise BrowserAutoDetectError(
@@ -675,9 +984,39 @@ def auto_detect_selectors(
         )
     detected["input"] = input_sel
 
+    # ---- RESPONSE: kick off in the background as soon as INPUT is known ---
+    # RESPONSE doesn't depend on INPUT's resolved VALUE or on SEND at all --
+    # only on the DOM already being in its final, post-launcher-click state,
+    # which is already true here (the launcher step above, if it ran,
+    # already happened before input_sel was resolved). Try the cheap
+    # heuristic scan first (page access, main thread, fast, no LLM); only if
+    # THAT misses do we snapshot the HTML now and hand the LLM lookup off to
+    # a background thread (_start_response_llm_job -- see its docstring for
+    # why this is safe: the worker function never touches `page`) so it runs
+    # CONCURRENTLY with SEND detection below instead of strictly after it.
+    # This is what actually cuts the worst-case chain length: the two LLM
+    # round-trips that used to always run one after another (SEND's
+    # fallback, then RESPONSE's) now overlap instead of stacking.
+    emit_event(on_event, "selector_detection_step", {"step": "response", "message": "Looking for the response container..."})
+    response_sel = _find_first_matching(page, _RESPONSE_CANDIDATES)
+    response_job: Optional[_ResponseDetectJob] = None
+    if not response_sel:
+        response_html = _stripped_body_html(page)
+        response_llm = _get_llm_or_raise()
+        response_job = _start_response_llm_job(response_llm, response_html, url)
+        print("[browser debug] RESPONSE heuristic missed -- LLM lookup started in the background, continuing with SEND detection...")
+    _check_budget("response detection (heuristic)")
+
     # ---- Step 3 of 4: SEND, scoped to input's own container ---------------
+    # Runs concurrently with the RESPONSE background job above, if one was
+    # started -- SEND is the one step in this window that genuinely needs
+    # `page` access, so it stays on the main thread exactly as before.
+    emit_event(on_event, "selector_detection_step", {"step": "send", "message": "Looking for the send button..."})
     send_sel = _detect_send_only(page, url, input_sel)
+    _check_budget("send detection")
     if not send_sel:
+        if response_job is not None:
+            response_job.join(timeout=1.0)  # don't leave a background job dangling before raising
         raise BrowserAutoDetectError(
             f"Auto-detection found the chat input ('{input_sel}') but could not "
             f"identify its send button on '{url}'. "
@@ -686,10 +1025,17 @@ def auto_detect_selectors(
         )
     detected["send"] = send_sel
 
-    # ---- Step 4 of 4: RESPONSE ----------------------------------------------
-    response_sel = _find_first_matching(page, _RESPONSE_CANDIDATES)
-    if not response_sel:
-        response_sel = _detect_response_only(page, url)
+    # ---- Step 4 of 4: RESPONSE -- join the background job, if one was started
+    if response_job is not None:
+        remaining_budget = max(0.0, deadline - time.perf_counter())
+        # A small grace period beyond the remaining wall-clock budget so a
+        # job that's ALMOST done (well within its own
+        # SELECTOR_DETECT_TIMEOUT_SECONDS) isn't cut off a fraction of a
+        # second early only to have _check_budget raise anyway right after
+        # with a less specific message than the job's own result would give.
+        candidate = response_job.join(timeout=remaining_budget + 2.0)
+        response_sel = _validate_llm_selector(candidate, "response", page, _is_chat_response_selector)
+    _check_budget("response detection")
     if not response_sel:
         raise BrowserAutoDetectError(
             f"Auto-detection found input ('{input_sel}') and send ('{send_sel}') "
@@ -1267,13 +1613,19 @@ def _do_login(page: Any, config: "BrowserConfig") -> None:  # type: ignore[name-
 # ==========================================================================
 # Main connector function
 # ==========================================================================
-def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type: ignore[name-defined]
+def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any] = None) -> AUTResponse:  # type: ignore[name-defined]
     """Open (or reuse) a browser, interact with the chatbot UI, and return
     the response text.
 
     This is the implementation called by aut/connector.py's _call_browser().
     It is kept here (separate file) to keep playwright's import isolated —
     the rest of the system never touches playwright directly.
+
+    on_event, if given, is forwarded to auto_detect_selectors() so a live
+    UI can show real progress during selector auto-detection instead of
+    going silent for however long it takes. None (the default) is a no-op
+    — every existing caller (including both browser-fixture test scripts)
+    is unaffected.
     """
     timeout_ms = int(config.wait_timeout_seconds * 1000)
 
@@ -1359,7 +1711,7 @@ def call_browser_aut(task: str, config: "BrowserConfig") -> AUTResponse:  # type
             or not config.response_selector.strip()
         )
         if needs_detect:
-            detected = auto_detect_selectors(page, config.chatbot_url, config)
+            detected = auto_detect_selectors(page, config.chatbot_url, config, on_event=on_event)
             input_sel = config.input_selector.strip() or detected["input"]
             send_sel = config.send_selector.strip() or detected["send"]
             response_sel = config.response_selector.strip() or detected["response"]

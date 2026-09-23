@@ -42,7 +42,7 @@ from typing import List, Optional, Tuple
 from crewai import Agent, Crew, Process, Task
 
 from agents.schemas import DescriberResult
-from aut.connector import AUTConfig, AUTConnectorError, call_aut
+from aut.connector import AUTConfig, AUTConnectorError, call_aut_with_retry
 from config.llm_config import get_llm
 from progress import OnEvent, emit_event
 
@@ -124,19 +124,19 @@ def build_describer_agent() -> Agent:
 # interface every AUT call in this project uses. Each runs exactly once per
 # describe_aut() call (see MAX_RETRIES note above).
 # ==========================================================================
-def _run_self_report_pass(aut_config: AUTConfig) -> str:
+def _run_self_report_pass(aut_config: AUTConfig, on_event: Optional[OnEvent] = None) -> str:
     try:
-        response = call_aut(SELF_REPORT_QUESTION, aut_config)
+        response = call_aut_with_retry(SELF_REPORT_QUESTION, aut_config, on_event=on_event)
     except AUTConnectorError as e:
         raise DescriberError(f"Describer's self-report pass failed calling the AUT: {e}") from e
     return response.output
 
 
-def _run_probe_pass(aut_config: AUTConfig) -> List[Tuple[str, str]]:
+def _run_probe_pass(aut_config: AUTConfig, on_event: Optional[OnEvent] = None) -> List[Tuple[str, str]]:
     pairs: List[Tuple[str, str]] = []
     for probe in PROBE_INPUTS:
         try:
-            response = call_aut(probe, aut_config)
+            response = call_aut_with_retry(probe, aut_config, on_event=on_event)
         except AUTConnectorError as e:
             raise DescriberError(
                 f"Describer's probe-and-infer pass failed calling the AUT on probe {probe!r}: {e}"
@@ -259,8 +259,8 @@ def describe_aut(aut_config: AUTConfig, on_event: Optional[OnEvent] = None) -> D
     emit_event(on_event, "describer_started")
 
     try:
-        self_report_answer = _run_self_report_pass(aut_config)
-        probe_pairs = _run_probe_pass(aut_config)
+        self_report_answer = _run_self_report_pass(aut_config, on_event=on_event)
+        probe_pairs = _run_probe_pass(aut_config, on_event=on_event)
     except DescriberError as e:
         emit_event(on_event, "error", {"stage": "describer_discovery", "message": str(e)})
         raise

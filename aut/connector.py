@@ -802,12 +802,16 @@ def _call_swagger_endpoint(task: str, config: SwaggerEndpointConfig) -> AUTRespo
     )
 
 
-def _call_browser(task: str, config: BrowserConfig) -> AUTResponse:
+def _call_browser(task: str, config: BrowserConfig, on_event: Optional[Any] = None) -> AUTResponse:
     """Drive a real browser to interact with the chatbot web UI.
     Delegates entirely to aut/playwright_connector.py so playwright's import
-    stays isolated from the rest of the connector layer."""
+    stays isolated from the rest of the connector layer. `on_event`, if
+    given, is forwarded so selector-auto-detection progress can surface
+    live (see playwright_connector.auto_detect_selectors) — every other
+    mode ignores it entirely, since only browser mode has a multi-step
+    detection phase worth narrating."""
     from aut.playwright_connector import call_browser_aut  # local import — keeps playwright optional
-    return call_browser_aut(task, config)
+    return call_browser_aut(task, config, on_event=on_event)
 
 
 # ==========================================================================
@@ -824,7 +828,7 @@ _DISPATCH: dict[str, Callable[[str, Any], AUTResponse]] = {
 }
 
 
-def call_aut(task: str, config: AUTConfig) -> AUTResponse:
+def call_aut(task: str, config: AUTConfig, on_event: Optional[Any] = None) -> AUTResponse:
     """
     Call the Agent Under Test, whatever it actually is, and return a
     uniform AUTResponse. This is the ONLY function the rest of EvalMind
@@ -836,6 +840,12 @@ def call_aut(task: str, config: AUTConfig) -> AUTResponse:
               to the AUT.
         config: a PublicAPIConfig, CustomEndpointConfig, FunctionImportConfig,
                 or ManualConfig instance — see each class's docstring.
+        on_event: optional progress callback (progress.OnEvent). Only
+                  "browser" mode does anything with it (selector
+                  auto-detection progress — see
+                  aut/playwright_connector.py::auto_detect_selectors).
+                  Every other mode ignores it. None (the default) is a
+                  no-op — every existing call site is unaffected.
 
     Returns:
         AUTResponse with the AUT's output, latency, and (where the active
@@ -855,4 +865,75 @@ def call_aut(task: str, config: AUTConfig) -> AUTResponse:
         raise ValueError("task must be a non-empty string")
 
     handler = _DISPATCH[config.mode]
+    if config.mode == "browser":
+        return handler(task, config, on_event=on_event)  # type: ignore[call-arg]
     return handler(task, config)
+
+
+# ==========================================================================
+# Retry wrapper — browser mode only. Selector auto-detection's first call
+# of a session chains up to 4 sequential LLM round-trips with nothing else
+# in the pipeline retrying the AUT call itself, so a single transient
+# hiccup (a momentary rate limit, one slow provider response, a page that
+# hadn't quite finished rendering) used to be immediately fatal — it took
+# down the whole evaluation run, not just one round. This wraps call_aut()
+# with a couple of short-backoff retries, but ONLY for the specific
+# transient error types browser mode can raise (BrowserAutoDetectError /
+# BrowserSelectorError / BrowserTimeoutError). Every other mode's errors
+# (a bad HTTP response, ManualLookupError, a genuine auth failure, etc.)
+# pass straight through unretried — a retry can't help a deterministic
+# failure and would just waste time/quota repeating it.
+# ==========================================================================
+def call_aut_with_retry(
+    task: str,
+    config: AUTConfig,
+    attempts: int = 2,
+    delay_seconds: float = 5.0,
+    on_event: Optional[Any] = None,
+) -> AUTResponse:
+    """Same contract as call_aut(), with up to `attempts` tries — but only
+    for browser-mode transient failures. A non-browser config, or a
+    non-transient browser error, behaves exactly like a plain call_aut()
+    call (the first raise wins): this is purely additive for the one
+    failure mode it targets, never a behavior change for anything else.
+
+    Args:
+        task, config, on_event: forwarded to call_aut() unchanged.
+        attempts: total tries (not extra retries) before giving up and
+                  re-raising the last transient error. Defaults to 2 (one
+                  retry).
+        delay_seconds: fixed pause between attempts. Kept short and fixed
+                       rather than exponential — this is meant to ride out
+                       a momentary blip, not a sustained outage (which will
+                       just fail again, correctly, on the final attempt).
+    """
+    if getattr(config, "mode", None) != "browser":
+        return call_aut(task, config, on_event=on_event)
+
+    try:
+        from aut.playwright_connector import (
+            BrowserAutoDetectError,
+            BrowserSelectorError,
+            BrowserTimeoutError,
+        )
+    except Exception:  # noqa: BLE001 - playwright not installed; nothing to retry against
+        return call_aut(task, config, on_event=on_event)
+
+    retriable = (BrowserAutoDetectError, BrowserSelectorError, BrowserTimeoutError)
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            return call_aut(task, config, on_event=on_event)
+        except retriable as e:  # noqa: BLE001 - intentionally narrow, see module note above
+            last_error = e
+            if attempt < attempts:
+                print(
+                    f"  [aut retry {attempt}/{attempts - 1}] transient browser error "
+                    f"({type(e).__name__}), retrying in {delay_seconds}s: {e}"
+                )
+                time.sleep(delay_seconds)
+            continue
+
+    assert last_error is not None  # loop always runs >=1 iteration
+    raise last_error

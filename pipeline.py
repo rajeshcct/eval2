@@ -31,7 +31,7 @@ from pydantic import BaseModel
 
 from agents.generator import generate_task
 from agents.judge import judge_round, compute_passed
-from aut.connector import AUTConfig, call_aut
+from aut.connector import AUTConfig, call_aut_with_retry
 from db.store import init_db, insert_round, insert_session
 from progress import OnEvent, emit_event
 
@@ -153,7 +153,7 @@ def run_single_round(
     #    aut_config specifies. call_aut() is the ONLY thing this pipeline
     #    knows about the AUT — it never branches on aut_config.mode itself.
     try:
-        aut_response = call_aut(generated.task_text, aut_config)
+        aut_response = call_aut_with_retry(generated.task_text, aut_config, on_event=on_event)
     except Exception as e:
         emit_event(on_event, "error", {"stage": "aut", "message": str(e)})
         raise

@@ -63,7 +63,7 @@ def _get_provider() -> str:
 # model for the Generator's adversarial task-writing, a mid-tier model for
 # the Judge's rubric-following scoring — without touching any agent code
 # beyond the get_llm(role=...) call site.
-VALID_ROLES = ("describer", "generator", "judge")
+VALID_ROLES = ("describer", "generator", "judge", "selector_detect")
 
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
@@ -95,7 +95,13 @@ def _resolve_model(provider: str, role: str | None) -> str:
 
 
 @lru_cache(maxsize=None)
-def get_llm(provider: str | None = None, temperature: float | None = None, role: str | None = None) -> LLM:
+def get_llm(
+    provider: str | None = None,
+    temperature: float | None = None,
+    role: str | None = None,
+    timeout: float | None = None,
+    max_tokens: int | None = None,
+) -> LLM:
     """
     Build (and cache) a crewai.LLM configured from .env.
 
@@ -106,15 +112,31 @@ def get_llm(provider: str | None = None, temperature: float | None = None, role:
         temperature: optional per-call override (e.g. a low, stable value for
                      an evaluator agent like the Judge). If omitted, the
                      provider's own default temperature is used.
-        role: optional one of "describer" | "generator" | "judge". When set,
-              the model is looked up from f"{PROVIDER}_MODEL_{ROLE}" first
-              (e.g. OPENAI_MODEL_JUDGE), falling back to the provider's
-              plain *_MODEL var if that's unset — so a role only needs its
-              own .env line when you actually want it on a different model
-              than the rest. (provider, temperature, role) triples are
+        role: optional one of "describer" | "generator" | "judge" |
+              "selector_detect". When set, the model is looked up from
+              f"{PROVIDER}_MODEL_{ROLE}" first (e.g. OPENAI_MODEL_JUDGE),
+              falling back to the provider's plain *_MODEL var if that's
+              unset — so a role only needs its own .env line when you
+              actually want it on a different model than the rest.
+              (provider, temperature, role, timeout, max_tokens) tuples are
               cached separately, so e.g. the Judge and Describer can each
               get their own LLM instance without either one mutating a
               shared object.
+        timeout: optional per-call HTTP timeout in seconds, passed straight
+                 through to crewai.LLM (and from there to litellm/the
+                 provider SDK). Left unset (None) preserves the previous
+                 behavior of falling back to whatever the provider SDK
+                 itself defaults to (commonly minutes, not seconds) — a
+                 caller that needs a fail-fast LLM (e.g. selector
+                 auto-detection, which must never let one slow/rate-limited
+                 response hang the whole browser session) should pass an
+                 explicit short value instead.
+        max_tokens: optional cap on the completion length. Left unset
+                    (None) preserves the provider's own default. Useful for
+                    a caller expecting a short, single-line answer (e.g.
+                    selector auto-detection), where an unbounded max_tokens
+                    has no benefit and only risks a slower/costlier
+                    response.
 
     Raises:
         ValueError: if role is given but isn't one of VALID_ROLES.
@@ -151,6 +173,10 @@ def get_llm(provider: str | None = None, temperature: float | None = None, role:
             pass
         else:
             kwargs["temperature"] = temperature
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
     return LLM(**kwargs)
 
 
