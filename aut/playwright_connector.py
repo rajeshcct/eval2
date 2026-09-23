@@ -144,7 +144,7 @@ _RESPONSE_CANDIDATES = [
 # address CPython reuses after garbage collection, which previously let a
 # later, unrelated BrowserConfig silently inherit an earlier run's cached
 # selectors for a completely different site.
-_SELECTOR_CACHE: dict[str, dict[str, str]] = {}
+_SELECTOR_CACHE: dict[str, dict[str, Optional[str]]] = {}
 
 # Keywords that betray a selector as a dropdown/autocomplete/filter rather
 # than a genuine free-text chat input. When the LLM hallucinates one of these
@@ -844,7 +844,7 @@ def auto_detect_selectors(
     config: Any,
     timeout_ms: int = 5000,
     on_event: Optional[Any] = None,
-) -> dict[str, str]:
+) -> dict[str, Optional[str]]:
     """Auto-detect launcher / input / send / response selectors for a chat
     UI — as a strict SEQUENCE, not one combined ask.
 
@@ -1011,17 +1011,23 @@ def auto_detect_selectors(
     # Runs concurrently with the RESPONSE background job above, if one was
     # started -- SEND is the one step in this window that genuinely needs
     # `page` access, so it stays on the main thread exactly as before.
+    #
+    # SEND is treated as OPTIONAL, not required: a lot of real chat UIs
+    # submit on Enter with no dedicated button at all, or use an icon-only
+    # button auto-detection can't reliably pin down (no aria-label/testid,
+    # only mounts once text is typed, etc). A miss here used to raise
+    # BrowserAutoDetectError and fail the whole round even though INPUT and
+    # RESPONSE were both found fine. Now a miss is just recorded as
+    # detected["send"] = None, and call_browser_aut() falls back to
+    # pressing Enter in the focused input instead of clicking a button.
     emit_event(on_event, "selector_detection_step", {"step": "send", "message": "Looking for the send button..."})
     send_sel = _detect_send_only(page, url, input_sel)
     _check_budget("send detection")
     if not send_sel:
-        if response_job is not None:
-            response_job.join(timeout=1.0)  # don't leave a background job dangling before raising
-        raise BrowserAutoDetectError(
-            f"Auto-detection found the chat input ('{input_sel}') but could not "
-            f"identify its send button on '{url}'. "
-            f"SOLUTION: Open the chatbot in Chrome → right-click the send button → "
-            f"Inspect → copy the selector and provide it as send_selector."
+        print(
+            f"[browser debug] No send button found near input '{input_sel}' on "
+            f"'{url}' -- will fall back to pressing Enter in the input field "
+            f"instead of clicking a button."
         )
     detected["send"] = send_sel
 
@@ -1713,7 +1719,7 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
         if needs_detect:
             detected = auto_detect_selectors(page, config.chatbot_url, config, on_event=on_event)
             input_sel = config.input_selector.strip() or detected["input"]
-            send_sel = config.send_selector.strip() or detected["send"]
+            send_sel = config.send_selector.strip() or detected.get("send")
             response_sel = config.response_selector.strip() or detected["response"]
             # NOTE: auto_detect_selectors now handles the launcher click + re-detection
             # internally, so we don't need to click it here again.
@@ -1725,8 +1731,14 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
         # Apply visibility filters:
         # INPUT + SEND: use nth=0 (first visible) to handle hidden duplicate elements (e.g. mobile layout variants)
         # RESPONSE: do NOT use nth=0 — chatbot responses are appended at the END, so we must watch the last one
+        #
+        # send_sel can legitimately be None/blank here -- no send button was
+        # detected (or none was configured) and the send step below falls
+        # back to pressing Enter in the input instead. Only wrap it with
+        # the visible-element idiom when there's an actual selector string;
+        # calling that on None/"" would crash on .lower().
         input_sel = _ensure_visible_sel(input_sel)
-        send_sel = _ensure_visible_sel(send_sel)
+        send_sel = _ensure_visible_sel(send_sel) if (send_sel and send_sel.strip()) else None
         response_sel = _ensure_visible_response_sel(response_sel)
 
         # Wait for input element
@@ -1776,15 +1788,47 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
                 f"'{input_sel}'{_selector_diagnostic(page, input_sel)}: {e}"
             ) from e
 
-        # Click send button
-        try:
-            send_locator = _wait_for_selector_with_frames(page, send_sel, timeout_ms)
-            send_locator.click()
-        except Exception as e:  # noqa: BLE001
-            raise BrowserSelectorError(
-                f"[{_classify_error(e)}] browser: send selector '{send_sel}' not found or "
-                f"not clickable{_selector_diagnostic(page, send_sel)}: {e}"
-            ) from e
+        # Click send button -- or, if no send selector was ever found/given,
+        # or the one we have doesn't resolve/click, fall back to pressing
+        # Enter in the already-focused input. Most real chat UIs submit on
+        # Enter regardless of whether they also render a visible send
+        # button, which covers exactly the cases auto-detection struggles
+        # with (icon-only buttons with no useful aria-label/testid, a
+        # button that only mounts once text is typed, etc).
+        send_method = "enter"
+        if send_sel:
+            if _selector_exists(page, send_sel):
+                try:
+                    send_locator = _wait_for_selector_with_frames(page, send_sel, timeout_ms)
+                    send_locator.click()
+                    send_method = "click"
+                except Exception as e:  # noqa: BLE001
+                    print(
+                        f"[browser debug] send selector '{send_sel}' was not "
+                        f"clickable ({_classify_error(e)}) -- falling back to "
+                        f"pressing Enter in the input '{input_sel}' instead: {e}"
+                    )
+            else:
+                print(
+                    f"[browser debug] send selector '{send_sel}' matches 0 "
+                    f"elements on the page -- skipping the wait and pressing "
+                    f"Enter in the input '{input_sel}' instead."
+                )
+        if send_method == "enter":
+            try:
+                input_locator.click()  # re-focus the input in case a failed send click moved focus
+                page.keyboard.press("Enter")
+            except Exception as e:  # noqa: BLE001
+                raise BrowserSelectorError(
+                    f"[{_classify_error(e)}] browser: "
+                    + (
+                        f"send selector '{send_sel}' was not usable and "
+                        if send_sel
+                        else "no send button was found or configured and "
+                    )
+                    + f"pressing Enter in input '{input_sel}' also failed"
+                    f"{_selector_diagnostic(page, input_sel)}: {e}"
+                ) from e
 
         # ---- Verify the send actually did something -----------------------
         def _current_input_text() -> str:
@@ -1815,14 +1859,22 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
             page.wait_for_timeout(150)
 
         if not cleared:
+            if send_method == "click":
+                raise BrowserSelectorError(
+                    f"browser: clicked send selector '{send_sel}' but input "
+                    f"'{input_sel}' still contains the typed task 3s later. This "
+                    f"usually means send_sel resolved to the wrong element (a "
+                    f"heuristic like 'form button:last-of-type' can match a "
+                    f"toolbar/regenerate button instead of Send) rather than a "
+                    f"slow-to-respond chatbot. Provide an explicit send_selector "
+                    f"if this one was auto-detected."
+                )
             raise BrowserSelectorError(
-                f"browser: clicked send selector '{send_sel}' but input "
-                f"'{input_sel}' still contains the typed task 3s later. This "
-                f"usually means send_sel resolved to the wrong element (a "
-                f"heuristic like 'form button:last-of-type' can match a "
-                f"toolbar/regenerate button instead of Send) rather than a "
-                f"slow-to-respond chatbot. Provide an explicit send_selector "
-                f"if this one was auto-detected."
+                f"browser: pressed Enter in input '{input_sel}' but it still "
+                f"contains the typed task 3s later. This chat UI likely "
+                f"requires clicking an actual send button rather than "
+                f"submitting on Enter -- provide an explicit send_selector "
+                f"instead of relying on auto-detection/the Enter fallback."
             )
 
         # ---- Wait for response -------------------------------------------
