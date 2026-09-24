@@ -42,7 +42,7 @@ from typing import List, Optional, Tuple
 from crewai import Agent, Crew, Process, Task
 
 from agents.schemas import DescriberResult
-from aut.connector import AUTConfig, AUTConnectorError, call_aut_with_retry
+from aut.connector import AUTConfig, AUTConnectorError, ManualLookupError, call_aut_with_retry
 from config.llm_config import get_llm
 from progress import OnEvent, emit_event
 
@@ -132,16 +132,52 @@ def _run_self_report_pass(aut_config: AUTConfig, on_event: Optional[OnEvent] = N
     return response.output
 
 
+# After this many probes fail IN A ROW the AUT is treated as unreachable and
+# the probe pass stops early instead of burning a full timeout on every
+# remaining probe.
+MAX_CONSECUTIVE_PROBE_FAILURES = 2
+
+
 def _run_probe_pass(aut_config: AUTConfig, on_event: Optional[OnEvent] = None) -> List[Tuple[str, str]]:
+    """Run the fixed probes against the AUT and collect (probe, output) pairs.
+
+    A single failed probe (timeout, empty reply, a flaky page) is SKIPPED with
+    a console warning rather than aborting discovery: the probes are generic
+    and a real AUT will legitimately refuse or stall on some of them, and one
+    bad probe used to throw away the whole run. Discovery still fails loudly
+    if NO probe produced an answer, or if the AUT stops answering entirely
+    (MAX_CONSECUTIVE_PROBE_FAILURES in a row). ManualLookupError stays fatal:
+    in manual mode a missing recorded probe is a broken fixture, not flakiness.
+    """
     pairs: List[Tuple[str, str]] = []
+    consecutive_failures = 0
+    last_error: Optional[Exception] = None
     for probe in PROBE_INPUTS:
         try:
             response = call_aut_with_retry(probe, aut_config, on_event=on_event)
-        except AUTConnectorError as e:
+        except ManualLookupError as e:
             raise DescriberError(
                 f"Describer's probe-and-infer pass failed calling the AUT on probe {probe!r}: {e}"
             ) from e
+        except AUTConnectorError as e:
+            last_error = e
+            consecutive_failures += 1
+            print(f"  [describer] probe {probe!r} failed and was skipped: {e}")
+            if consecutive_failures >= MAX_CONSECUTIVE_PROBE_FAILURES:
+                print(
+                    f"  [describer] {consecutive_failures} probes failed in a row -- "
+                    f"AUT looks unreachable, stopping the probe pass early."
+                )
+                break
+            continue
+        consecutive_failures = 0
         pairs.append((probe, response.output))
+
+    if not pairs:
+        raise DescriberError(
+            f"Describer's probe-and-infer pass got no usable answer from the AUT "
+            f"(every probe attempted failed). Last error: {last_error}"
+        ) from last_error
     return pairs
 
 
@@ -272,7 +308,20 @@ def describe_aut(aut_config: AUTConfig, on_event: Optional[OnEvent] = None) -> D
         try:
             describer_task = _build_describer_task(agent, self_report_answer, probe_pairs)
             crew = Crew(agents=[agent], tasks=[describer_task], process=Process.sequential, verbose=False)
-            crew_output = crew.kickoff()
+            
+            import asyncio
+            try:
+                asyncio.get_running_loop()
+                in_loop = True
+            except RuntimeError:
+                in_loop = False
+                
+            if in_loop:
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    crew_output = executor.submit(crew.kickoff).result()
+            else:
+                crew_output = crew.kickoff()
 
             result = _extract_pydantic_result(crew_output, describer_task)
             if result is None:

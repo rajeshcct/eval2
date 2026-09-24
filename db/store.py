@@ -64,6 +64,29 @@ def insert_session(
         conn.close()
 
 
+def update_session_description(
+    session_id: str,
+    aut_description: str,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> None:
+    """Overwrite an existing session's aut_description.
+
+    run_full_session() now creates the session row BEFORE the Describer runs
+    (so a run that dies during discovery still leaves a trace in the DB), with
+    a placeholder description; this swaps in the real, auto-discovered one
+    once it is known. A no-op if the session id doesn't exist.
+    """
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE sessions SET aut_description = ? WHERE id = ?",
+            (aut_description, session_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_session(session_id: str, db_path: Path = DEFAULT_DB_PATH) -> Optional[dict[str, Any]]:
     """Fetch one session row (id, aut_description, started_at), or None if it
     doesn't exist. Added for Block G's Aggregator, which needs a session's

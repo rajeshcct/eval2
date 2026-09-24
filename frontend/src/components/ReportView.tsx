@@ -350,6 +350,7 @@ function CategorySection({
   forcedOpen: boolean;
 }) {
   const broken = report.status === "broken";
+  const incomplete = Boolean(report.incomplete);
 
   return (
     <section className="break-inside-avoid rounded-lg border border-slate-800 bg-slate-900/40 print:border-slate-300 print:bg-white">
@@ -363,10 +364,12 @@ function CategorySection({
             className={`rounded px-2 py-0.5 text-xs font-medium ${
               broken
                 ? "bg-red-950 text-red-300 print:bg-red-100 print:text-red-800"
-                : "bg-emerald-950 text-emerald-300 print:bg-emerald-100 print:text-emerald-800"
+                : incomplete
+                  ? "bg-amber-950 text-amber-300 print:bg-amber-100 print:text-amber-800"
+                  : "bg-emerald-950 text-emerald-300 print:bg-emerald-100 print:text-emerald-800"
             }`}
           >
-            {broken ? "Broken" : "Robust"}
+            {broken ? "Broken" : incomplete ? "Incomplete" : "Robust"}
           </span>
         </div>
       </div>
@@ -378,9 +381,15 @@ function CategorySection({
             <div className="mt-1 text-red-300/90 print:text-red-800/90">{report.breaking_point_summary}</div>
           )}
         </div>
-      ) : (
+      ) : incomplete ? null : (
         <div className="border-b border-slate-800 bg-emerald-950/20 px-4 py-2 text-xs text-emerald-300 print:border-slate-200 print:bg-emerald-50 print:text-emerald-800">
           Robust — survived every round up to the cap
+        </div>
+      )}
+      {incomplete && (
+        <div className="border-b border-amber-900 bg-amber-950/30 px-4 py-2 text-xs text-amber-300 print:border-slate-200 print:bg-amber-50 print:text-amber-800">
+          Run cut short by an error — only {report.round_history.length} round(s) completed for this category, so
+          this is not a full pass.
         </div>
       )}
 
@@ -550,7 +559,8 @@ export default function ReportView({ report, onReset }: ReportViewProps) {
   const presentCategories = CATEGORY_ORDER.map((c) => currentReport.categories[c]).filter(
     (c): c is CategoryReport => Boolean(c),
   );
-  const allRobust = presentCategories.length > 0 && presentCategories.every((c) => c.status !== "broken");
+  const allRobust =
+    presentCategories.length > 0 && presentCategories.every((c) => c.status !== "broken" && !c.incomplete);
   const glanceEntries = CATEGORY_ORDER.flatMap((c) => {
     const cat = currentReport.categories[c];
     return cat ? [{ key: c, report: cat }] : [];

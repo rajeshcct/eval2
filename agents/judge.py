@@ -246,7 +246,20 @@ def judge_round(task: str, output: str, category: str) -> JudgeScore:
         try:
             judge_task = _build_judge_task(agent, task, output, category)
             crew = Crew(agents=[agent], tasks=[judge_task], process=Process.sequential, verbose=False)
-            crew_output = crew.kickoff()
+            
+            import asyncio
+            try:
+                asyncio.get_running_loop()
+                in_loop = True
+            except RuntimeError:
+                in_loop = False
+                
+            if in_loop:
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    crew_output = executor.submit(crew.kickoff).result()
+            else:
+                crew_output = crew.kickoff()
 
             result = _extract_pydantic_result(crew_output, judge_task)
             if result is None:

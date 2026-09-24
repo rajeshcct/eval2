@@ -73,6 +73,13 @@ class BrowserAutoDetectError(AUTConnectorError):
     """Auto-detection of selectors failed even after heuristics + LLM vision."""
 
 
+class BrowserTransientError(AUTConnectorError):
+    """An unexpected (non-selector, non-timeout) browser/Playwright failure,
+    e.g. the page or browser was closed mid-call. Raw Playwright exceptions
+    are wrapped in this so callers only ever see AUTConnectorError
+    subclasses (and so the retry wrapper in aut/connector.py can cover them)."""
+
+
 # Selector-detection LLM calls get their own short, fail-fast timeout and a
 # hard wall-clock budget for the whole auto_detect_selectors() sequence —
 # previously neither existed: the LLM call itself had no timeout (falling
@@ -123,19 +130,19 @@ _SEND_CANDIDATES = [
 ]
 
 _RESPONSE_CANDIDATES = [
-    "[data-testid*='bot-message']:last-child",
-    "[data-testid*='assistant']:last-child",
-    "[data-testid*='response']:last-child",
-    "[data-testid*='answer']:last-child",
-    "[data-testid*='message']:last-child",
-    ".assistant-message:last-child",
-    ".bot-message:last-child",
-    "[class*='assistant']:last-child",
-    "[class*='bot']:last-child",
-    "[class*='response']:last-child",
-    "[role='article']:last-child",
-    ".message:last-child",
-    "[class*='message']:last-child",
+    "[data-testid*='bot-message']",
+    "[data-testid*='assistant']",
+    "[data-testid*='response']",
+    "[data-testid*='answer']",
+    ".assistant-message",
+    ".bot-message",
+    ".chat-message.bot",
+    ".chat-message.ai",
+    ".chat-bubble",
+    ".message-bubble",
+    "[class*='bot-message']",
+    "[class*='ai-message']",
+    "[role='article']",
 ]
 
 # Cache: config.session_key → {"input": sel, "send": sel, "response": sel}
@@ -160,9 +167,8 @@ _NOT_CHAT_INPUT_CLUES = (
     "typeahead",
 )
 
-# Keywords that reveal a generic page container rather than a chat message.
-# Accepting these as response_sel means text_change never fires because the
-# container existed before the chat started.
+# Keywords that reveal a generic page container or an input/send control
+# rather than an actual bot reply message bubble.
 _NOT_CHAT_RESPONSE_CLUES = (
     "card-body",        # Bootstrap generic card — present from page load
     "card",
@@ -172,6 +178,14 @@ _NOT_CHAT_RESPONSE_CLUES = (
     "header",
     "footer",
     "modal",
+    "input",            # never an input box!
+    "textarea",
+    "textbox",
+    "send",             # never a send button!
+    "submit",
+    "button",
+    "composer",
+    "compose",
 )
 
 
@@ -243,6 +257,23 @@ _LAUNCHER_CANDIDATES = [
     "[class*='launcher']",
     "[id*='chat-launcher']",
     "[id*='chat-widget-button']",
+    # Common AI assistant / chatbot floating button patterns
+    ".ai-assistant-btn",
+    "[class*='ai-assistant-btn']",
+    "[class*='ai-assistant'][class*='btn']",
+    "[class*='ai-assistant'][class*='button']",
+    "[class*='chatbot-btn']",
+    "[class*='chatbot-button']",
+    "[class*='chat-btn']",
+    "[class*='chat-button']",
+    "[class*='assistant-btn']",
+    "[class*='assistant-button']",
+    "[class*='chat-toggle']",
+    "[class*='chat-open']",
+    "[class*='open-chat']",
+    "[id*='ai-assistant']",
+    "[id*='chatbot-btn']",
+    "[id*='chat-btn']",
 ]
 
 
@@ -412,9 +443,18 @@ def _find_scoped_send_candidate(page: Any, input_sel: str, candidates: list[str]
                     visible_scoped = container.locator(f"{sel} >> visible=true")
                     if visible_scoped.count() != 1:
                         continue
-                if page.locator(sel).count() != 1:
-                    continue
-                return sel
+                if page.locator(sel).count() == 1:
+                    return sel
+                # If sel is ambiguous globally (e.g. other buttons exist on the dashboard),
+                # try scoping it specifically to the chat widget wrapper.
+                for wrapper in (".ai-assistant-wrapper", "[class*='assistant']", "[class*='chat']"):
+                    scoped_sel = f"{wrapper} {sel}"
+                    try:
+                        if page.locator(scoped_sel).count() == 1:
+                            return scoped_sel
+                    except Exception:
+                        continue
+                continue
             except Exception:  # noqa: BLE001
                 continue
         return None
@@ -428,10 +468,14 @@ def _find_scoped_send_candidate(page: Any, input_sel: str, candidates: list[str]
             pass
 
 
-def _stripped_body_html(page: Any, max_chars: int = 30000) -> str:
+def _stripped_body_html(page: Any, max_chars: int = 10000) -> str:
     """Full-page HTML with script/style/svg/media stripped, for the
     LAUNCHER/INPUT/RESPONSE LLM fallbacks, which need to see wherever in
-    the page their target actually lives."""
+    the page their target actually lives.
+    
+    Capped at 10,000 chars (~2,500 tokens) to strictly stay within low-tier
+    provider token-per-minute quotas (such as Groq's 7,000 ITPM limit).
+    """
     try:
         html = page.evaluate('''() => {
             let clone = document.body.cloneNode(true);
@@ -443,7 +487,7 @@ def _stripped_body_html(page: Any, max_chars: int = 30000) -> str:
         return ""
 
 
-def _get_input_container_html(page: Any, input_sel: str, max_chars: int = 8000) -> str:
+def _get_input_container_html(page: Any, input_sel: str, max_chars: int = 6000) -> str:
     """Return the outerHTML of a small ancestor of the input element — the
     smallest container that plausibly holds the whole message-compose row
     (input + send button). Used to scope the SEND LLM fallback to a tiny,
@@ -471,6 +515,48 @@ def _get_input_container_html(page: Any, input_sel: str, max_chars: int = 8000) 
             input_sel,
         )
         if html:
+            return html[:max_chars]
+    except Exception:  # noqa: BLE001
+        pass
+    return _stripped_body_html(page, max_chars=max_chars)
+
+
+def _get_chat_panel_html(page: Any, input_sel: str, max_chars: int = 8000) -> str:
+    """Return the stripped innerHTML of the chat panel/wrapper that contains
+    input_sel. Scoping to this container keeps token size under ~2,000 tokens
+    (well below provider RPM/ITPM limits) and avoids confusing the model with
+    unrelated dashboard content.
+    """
+    try:
+        html = page.evaluate(
+            """(sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return null;
+                let node = el;
+                for (let i = 0; i < 10; i++) {
+                    if (!node.parentElement) break;
+                    node = node.parentElement;
+                    const cls = (node.className || '').toString().toLowerCase();
+                    const id = (node.id || '').toLowerCase();
+                    if (
+                        cls.includes('assistant') ||
+                        cls.includes('chat') ||
+                        cls.includes('widget') ||
+                        cls.includes('modal') ||
+                        cls.includes('dialog') ||
+                        id.includes('chat') ||
+                        id.includes('assistant')
+                    ) {
+                        break;
+                    }
+                }
+                const clone = node.cloneNode(true);
+                clone.querySelectorAll('script, style, svg, path, img, video, iframe, noscript').forEach(e => e.remove());
+                return clone.innerHTML;
+            }""",
+            input_sel,
+        )
+        if html and len(html.strip()) > 50:
             return html[:max_chars]
     except Exception:  # noqa: BLE001
         pass
@@ -523,11 +609,25 @@ def _llm_ask_selector(llm: Any, prompt: str, role: str) -> Optional[str]:
     allowed to touch `page` — see _llm_find_one_selector for the
     synchronous, single-thread version of that full sequence.
     """
-    try:
-        answer = llm.call(messages=[{"role": "user", "content": prompt}])
-    except Exception as e:  # noqa: BLE001
-        print(f"[browser debug] LLM call for '{role}' failed: {e}")
+    _RETRYABLE = ("503", "529", "429", "rate limit", "overload", "unavailable", "high demand")
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            answer = llm.call(messages=[{"role": "user", "content": prompt}])
+            break
+        except Exception as e:  # noqa: BLE001
+            err_str = str(e).lower()
+            is_retryable = any(tok in err_str for tok in _RETRYABLE)
+            if is_retryable and attempt < max_attempts:
+                wait = 5.0 * attempt
+                print(f"[browser debug] LLM call for '{role}' failed (attempt {attempt}/{max_attempts}, retrying in {wait:.0f}s): {e}")
+                time.sleep(wait)
+            else:
+                print(f"[browser debug] LLM call for '{role}' failed: {e}")
+                return None
+    else:
         return None
+
     if not isinstance(answer, str):
         answer = str(answer)
     print(f"[browser debug] LLM {role.upper()} RAW ANSWER:\n{answer[:1000]}")
@@ -627,6 +727,8 @@ def _start_response_llm_job(llm: Any, html: str, url: str) -> _ResponseDetectJob
 
 Find the CSS selector for the element that holds the BOT's reply messages (the latest one). Use :last-child or :last-of-type if it's a list. Do not pick a generic dashboard card, sidebar, or navbar.
 
+CRITICAL: Do NOT select .chat-input, input, textarea, composer, or send button. The selector MUST target a chat message bubble or bot reply element.
+
 Give exactly ONE CSS selector — never a comma-separated list of alternatives.
 
 Respond with EXACTLY one line:
@@ -663,7 +765,15 @@ def _detect_launcher_only(page: Any, url: str) -> Optional[str]:
     html = _stripped_body_html(page, max_chars=20000)
     prompt = f"""You are a web automation expert. Below is the stripped HTML of a page at {url}.
 
-Is there a floating button, icon, or bubble whose job is to OPEN a chat/assistant panel (as opposed to a chat input that's already visible on the page)? If the chat is already open/visible and no such button is needed, answer None.
+Is there a floating button, icon, or bubble whose job is to OPEN a chat/assistant panel (as opposed to a chat input that's already visible on the page)?
+
+These launcher buttons are usually small, fixed-position elements (often bottom-right corner of the screen) and are commonly identified by wording such as: "chat", "chatbot", "AI chatbot", "AI assistant", "assistant", "support", "help", "ask us", "talk to us", "contact us", "live chat", "message us" -- look for these words, or close variants, in the element's class name, id, aria-label, title, alt text, or visible label. A speech-bubble / message-bubble icon with no visible text but one of these words in its aria-label/title/data-* attribute also counts.
+
+Common class name patterns to look for: `ai-assistant-btn`, `chat-btn`, `chatbot-btn`, `chat-button`, `assistant-btn`, `ai-assistant-button`, `chat-toggle`, `chat-launcher`, `chat-bubble`, `launcher`.
+
+IMPORTANT: If you can see any element in the HTML with a class or id containing 'ai-assistant', 'chatbot', 'chat-btn', 'chat-button', or 'launcher' — that is almost certainly the launcher button. Select it.
+
+If the chat is already open/visible on the page and no such button is needed, answer None.
 
 Give exactly ONE CSS selector — never a comma-separated list of alternatives.
 
@@ -683,7 +793,9 @@ def _detect_input_only(page: Any, url: str) -> Optional[str]:
     html = _stripped_body_html(page)
     prompt = f"""You are a web automation expert. Below is the stripped HTML of a chatbot UI at {url}.
 
-Find the CSS selector for the TEXT INPUT / TEXTAREA where a user TYPES their chat message. It must be an editable field — not a dropdown, filter, or search bar.
+Find the CSS selector for the TEXT INPUT / TEXTAREA where a user TYPES their chat message -- the same kind of box used at the bottom of modern AI chat apps like Claude.ai or ChatGPT: a single message-composer field (a <textarea>, an auto-growing text box, or a contenteditable div acting like one) that sits near the bottom of the chat panel, typically right next to or just above a send button, often with placeholder text like "Message...", "Ask anything", "Type a message", "Type your message...", or similar chat-style wording.
+
+It must be an editable field for composing a NEW outgoing message -- not a dropdown, a site-wide search bar, a filter box, or an input belonging to some unrelated form elsewhere on the page (login, newsletter signup, etc.).
 
 Give exactly ONE CSS selector — never a comma-separated list of alternatives.
 
@@ -724,10 +836,12 @@ def _detect_response_only(page: Any, url: str) -> Optional[str]:
     """STEP: single-purpose LLM fallback for the bot-response container,
     run last, against the final (post-launcher, if any) DOM."""
     llm = _get_llm_or_raise()
-    html = _stripped_body_html(page)
+    html = _stripped_body_html(page, max_chars=8000)
     prompt = f"""You are a web automation expert. Below is the stripped HTML of a chatbot UI at {url}.
 
 Find the CSS selector for the element that holds the BOT's reply messages (the latest one). Use :last-child or :last-of-type if it's a list. Do not pick a generic dashboard card, sidebar, or navbar.
+
+CRITICAL: Do NOT select .chat-input, input, textarea, composer, or send button. The selector MUST target a chat message bubble or bot reply element.
 
 Give exactly ONE CSS selector — never a comma-separated list of alternatives.
 
@@ -783,6 +897,89 @@ def _find_first_matching(page: Any, candidates: list[str]) -> Optional[str]:
             # before giving up on this candidate.
             visible_locator = page.locator(f"{sel} >> visible=true")
             if visible_locator.count() == 1:
+                return sel
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _detect_response_from_live_dom(page: Any) -> Optional[str]:
+    """Inspect the live DOM for an existing bot message bubble (greeting or history).
+    Returns a robust CSS selector targeting message bubbles, or None.
+    """
+    try:
+        selector = page.evaluate("""() => {
+            // Find greeting text or AI badge
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+            let node;
+            let targetEl = null;
+            while ((node = walker.nextNode())) {
+                const val = (node.nodeValue || '').trim();
+                if (
+                    val.includes("fleet management assistant") ||
+                    val.includes("Navigatto AI, your") ||
+                    val.includes("fleet operations") ||
+                    val.includes("fleet analytics") ||
+                    (val === "AI" && node.parentElement?.offsetWidth > 0 && node.parentElement?.offsetWidth < 60)
+                ) {
+                    targetEl = node.parentElement;
+                    break;
+                }
+            }
+            if (!targetEl) return null;
+
+            // If we found the AI avatar badge ("AI"), look for its sibling or adjacent message bubble
+            if (targetEl.textContent.trim() === "AI" || targetEl.innerText?.trim() === "AI") {
+                let sibling = targetEl.nextElementSibling;
+                while (sibling) {
+                    if (sibling.innerText && sibling.innerText.length > 5) {
+                        targetEl = sibling;
+                        break;
+                    }
+                    sibling = sibling.nextElementSibling;
+                }
+            }
+
+            // Climb up to find a message container
+            let curr = targetEl;
+            for (let i = 0; i < 6; i++) {
+                if (!curr || curr === document.body) break;
+                const cls = (curr.className || '').toString();
+                const classes = cls.split(' ').map(c => c.trim()).filter(Boolean);
+                for (const c of classes) {
+                    const lc = c.toLowerCase();
+                    if (
+                        (lc.includes('message') || lc.includes('bubble') || lc.includes('reply') || lc.includes('body')) &&
+                        !lc.includes('input') && !lc.includes('send') && !lc.includes('avatar') && !lc.includes('wrapper')
+                    ) {
+                        const sel = `.${c}`;
+                        try {
+                            const count = document.querySelectorAll(sel).length;
+                            if (count >= 1 && count <= 50) return sel;
+                        } catch(e) {}
+                    }
+                }
+                curr = curr.parentElement;
+            }
+            return null;
+        }""")
+        if selector and _is_chat_response_selector(selector):
+            print(f"[browser debug] Live DOM detected bot response selector: '{selector}'")
+            return selector
+    except Exception as e:
+        print(f"[browser debug] Live DOM response detection failed: {e}")
+    return None
+
+
+def _find_first_response_matching(page: Any, candidates: list[str]) -> Optional[str]:
+    """Return the first candidate that matches at least one visible element.
+    Chat message lists naturally contain multiple messages (greetings, history),
+    so count >= 1 is valid (downstream code always uses .last to read the newest).
+    """
+    for sel in candidates:
+        try:
+            visible_locator = page.locator(f"{sel} >> visible=true")
+            if visible_locator.count() >= 1:
                 return sel
         except Exception:  # noqa: BLE001
             continue
@@ -998,10 +1195,12 @@ def auto_detect_selectors(
     # round-trips that used to always run one after another (SEND's
     # fallback, then RESPONSE's) now overlap instead of stacking.
     emit_event(on_event, "selector_detection_step", {"step": "response", "message": "Looking for the response container..."})
-    response_sel = _find_first_matching(page, _RESPONSE_CANDIDATES)
+    response_sel = _detect_response_from_live_dom(page)
+    if not response_sel:
+        response_sel = _find_first_response_matching(page, _RESPONSE_CANDIDATES)
     response_job: Optional[_ResponseDetectJob] = None
     if not response_sel:
-        response_html = _stripped_body_html(page)
+        response_html = _get_chat_panel_html(page, input_sel, max_chars=8000)
         response_llm = _get_llm_or_raise()
         response_job = _start_response_llm_job(response_llm, response_html, url)
         print("[browser debug] RESPONSE heuristic missed -- LLM lookup started in the background, continuing with SEND detection...")
@@ -1068,6 +1267,7 @@ class _BrowserSession:
     logged_in: bool = False
     active_pages: list[Any] = field(default_factory=list)
     main_page: Any = None
+    pw: Any = None  # the sync_playwright() driver; MUST be stopped in close_session()
 
     @property
     def current_page(self) -> Any:
@@ -1107,10 +1307,17 @@ def _get_or_create_session(config: "BrowserConfig") -> _BrowserSession:  # type:
     # Sites that spot it often don't error — they silently serve a
     # stripped-down page (missing real form fields, banner, etc.), which is
     # exactly the "fields stay blank, nothing throws" symptom this fixes.
-    browser = pw.chromium.launch(
-        headless=config.headless,
-        args=["--disable-blink-features=AutomationControlled"],
-    )
+    try:
+        browser = pw.chromium.launch(
+            headless=config.headless,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+    except Exception:
+        # A driver left running keeps an asyncio loop alive on this thread, which
+        # turns every later sync_playwright().start() into a misleading
+        # "Sync API inside the asyncio loop" error instead of the real one.
+        _stop_playwright_quietly(pw)
+        raise
     context = browser.new_context(
         viewport={"width": 1280, "height": 800},
         user_agent=(
@@ -1130,7 +1337,7 @@ def _get_or_create_session(config: "BrowserConfig") -> _BrowserSession:  # type:
         window.chrome = window.chrome || { runtime: {} };
         """
     )
-    session = _BrowserSession(browser=browser, context=context)
+    session = _BrowserSession(browser=browser, context=context, pw=pw)
     
     def on_page(new_page: Any) -> None:
         session.active_pages.append(new_page)
@@ -1155,6 +1362,20 @@ def close_session(config: "BrowserConfig") -> None:  # type: ignore[name-defined
         pass
     try:
         session.browser.close()
+    except Exception:  # noqa: BLE001
+        pass
+    # Without this the Playwright driver (and its asyncio loop) outlives the
+    # session, and the NEXT run on the same worker thread fails instantly with
+    # "It looks like you are using Playwright Sync API inside the asyncio loop".
+    _stop_playwright_quietly(session.pw)
+
+
+def _stop_playwright_quietly(pw: Any) -> None:
+    """Stop a sync_playwright() driver, never raising."""
+    if pw is None:
+        return
+    try:
+        pw.stop()
     except Exception:  # noqa: BLE001
         pass
 
@@ -1460,6 +1681,257 @@ def _wait_for_selector_with_frames(
 
 
 # ==========================================================================
+# Send/receive helpers used by call_browser_aut()
+# ==========================================================================
+_PLACEHOLDER_TEXTS = frozenset({
+    "typing", "thinking", "generating", "loading", "processing", "writing",
+    "analyzing", "analysing", "searching", "working", "please wait",
+    "one moment", "just a moment",
+})
+
+
+def _norm_ws(text: Optional[str]) -> str:
+    """Collapse every whitespace run (newlines included) to one space."""
+    return " ".join((text or "").split())
+
+
+def _is_placeholder_text(text: Optional[str]) -> bool:
+    """True for empty text and for transient 'bot is busy' bubbles such as
+    "Typing..." / "Bot is thinking…" — never a finished reply."""
+    t = _norm_ws(text).lower().strip(" .…·•*_-")
+    if not t:
+        return True
+        
+    # Strip UI metadata (timestamps, AI labels) so we can cleanly check the core message
+    cleaned = _clean_ui_metadata(t)
+    
+    if cleaned in _PLACEHOLDER_TEXTS:
+        return True
+        
+    # Also ignore the specific custom loading spinner for the Navigatto AUT
+    if "analyzing your fleet data" in cleaned:
+        return True
+        
+    return cleaned.endswith(("is typing", "is thinking", "is writing", "is generating"))
+
+
+def _is_echo_of_task(text: Optional[str], task: str) -> bool:
+    """True if `text` is just the user's own message echoed back in a bubble
+    (a response selector such as '.message' matches user AND bot bubbles).
+    Exact match always counts; for longer tasks a short trailing suffix
+    (timestamp / 'You') is tolerated too."""
+    t, k = _norm_ws(text), _norm_ws(task)
+    if not t or not k:
+        return False
+    if t == k:
+        return True
+    return len(k) >= 30 and k in t and len(t) - len(k) <= 25
+
+
+def _strip_task(text: str, task: str) -> str:
+    """If the text contains the user's task (e.g. it's a newly appended chunk
+    in a generic chat container containing both the task and the response),
+    strip the task out to return just the bot's response."""
+    if not text or not task:
+        return text
+    
+    # Try to find the task allowing for arbitrary whitespace formatting in the DOM
+    norm_task = " ".join(task.split())
+    if not norm_task:
+        return text
+        
+    escaped_words = [re.escape(w) for w in norm_task.split()]
+    pattern = r'\s*'.join(escaped_words)
+    
+    # Search for the first occurrence of the task. Because this is only called
+    # on the newly appended text block, the first occurrence is almost certainly
+    # the user's chat bubble, not the bot repeating it later.
+    match = re.search(pattern, text, re.IGNORECASE)
+    if match:
+        return text[match.end():].strip()
+    return text
+
+
+def _clean_ui_metadata(text: str) -> str:
+    """Strip common chat UI artifacts (timestamps, AI/Bot tags) that confuse the generator."""
+    if not text:
+        return text
+    # Remove timestamps like "2:34 PM", "14:34", "10:00 AM"
+    cleaned = re.sub(r'\b\d{1,2}:\d{2}\s*(?:am|pm|a\.m\.|p\.m\.)?\b', '', text, flags=re.IGNORECASE)
+    # Remove isolated speaker tags at the very start or end
+    cleaned = re.sub(r'^(?:\s*(?:AI|Bot|System|U|You)\s*)+', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'(?:\s*(?:AI|Bot|System|U|You)\s*)+$', '', cleaned, flags=re.IGNORECASE)
+    # Collapse multiple spaces
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip(" |-\n")
+    return cleaned
+
+
+def _read_last_response(page: Any, sel: str) -> tuple[int, str]:
+    """(match_count, inner_text of the LAST match) for a response selector.
+    Falls back to child frames when the main page has no match."""
+    loc = page.locator(sel)
+    count = loc.count()
+    if count > 0:
+        try:
+            return count, loc.last.inner_text(timeout=2000) or ""
+        except Exception:  # noqa: BLE001
+            return count, ""
+    el = _query_in_frames(page, sel)
+    if el is not None:
+        try:
+            return 1, el.inner_text() or ""
+        except Exception:  # noqa: BLE001
+            return 1, ""
+    return 0, ""
+
+
+def _mark_last_response_node(page: Any, sel: str) -> None:
+    """Remember the current last response node so _last_node_is_new() can tell
+    a freshly-appended (or replaced) node from the old one. Only touches the
+    DOM when a match exists — locator.evaluate() on a missing element would
+    otherwise auto-wait ~30s."""
+    try:
+        loc = page.locator(sel)
+        if loc.count() > 0:
+            loc.last.evaluate("el => { window._evalmind_last_node = el; }", timeout=2000)
+        else:
+            page.evaluate("() => { window._evalmind_last_node = null; }")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _last_node_is_new(page: Any, sel: str) -> bool:
+    try:
+        loc = page.locator(sel)
+        if loc.count() == 0:
+            return False
+        return bool(loc.last.evaluate("el => el !== window._evalmind_last_node", timeout=1000))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _wait_for_response_text(
+    page: Any,
+    response_sel: str,
+    task: str,
+    before_count: int,
+    before_text: str,
+    *,
+    require_new_node: bool,
+    timeout_s: float,
+    stability_s: float = 1.0,
+    poll_ms: int = 250,
+) -> Optional[str]:
+    """Poll until a NEW, finished bot reply is on the page; return its text,
+    or None on timeout.
+
+    "New" means the number of matches grew, or (new_element) the last node is
+    a different DOM node, or (text_change) the last node's text differs from
+    before the send. Counting matches is what makes a reply that is textually
+    identical to the previous one still detectable. Candidates that are just
+    the user's own echoed message or a "Typing..." placeholder are ignored,
+    and a candidate must stay unchanged for `stability_s` (a still-streaming
+    reply keeps resetting the clock)."""
+    deadline = time.perf_counter() + timeout_s
+    last_seen: Optional[str] = None
+    stable_since: Optional[float] = None
+    while time.perf_counter() < deadline:
+        try:
+            count, raw = _read_last_response(page, response_sel)
+            text = (raw or "").strip()
+            is_new = False
+            if count > 0:
+                is_new = count > before_count
+                if not is_new and require_new_node:
+                    is_new = _last_node_is_new(page, response_sel)
+                if not is_new and not require_new_node:
+                    is_new = text != before_text
+                    
+            if is_new:
+                clean_text = text
+                if count == before_count and before_text:
+                    if clean_text.startswith(before_text):
+                        clean_text = clean_text[len(before_text):].strip()
+                    else:
+                        idx = clean_text.rfind(task.strip()[:20])
+                        if idx != -1:
+                            clean_text = clean_text[idx:].strip()
+                            
+                    clean_text = _strip_task(clean_text, task)
+
+                if not _is_placeholder_text(clean_text) and not _is_echo_of_task(clean_text, task):
+                    now = time.perf_counter()
+                    if clean_text != last_seen:
+                        last_seen, stable_since = clean_text, now
+                    elif stable_since is not None and (now - stable_since) >= stability_s:
+                        return _clean_ui_metadata(clean_text)
+                else:
+                    last_seen, stable_since = None, None
+            else:
+                last_seen, stable_since = None, None
+        except Exception:  # noqa: BLE001
+            pass
+        page.wait_for_timeout(poll_ms)
+    return None
+
+
+def _type_task(page: Any, input_locator: Any, task: str) -> str:
+    """Type `task` into the focused, already-cleared input and return the exact
+    text typed (used by the send-verification check).
+
+    A bare newline makes keyboard.type() press Enter, which SENDS the message,
+    so a multi-line task (the Generator's higher levels use emails/logs) used
+    to go out as several separate chat messages. Multi-line text is now typed
+    line by line with Shift+Enter between lines (newline, don't send). A
+    single-line <input> has no newline (Shift+Enter would still submit), so
+    there the lines are joined with spaces instead."""
+    normalized = task.replace("\r\n", "\n").replace("\r", "\n")
+    if "\n" not in normalized:
+        page.keyboard.type(normalized, delay=30)
+        return normalized
+    try:
+        tag = str(input_locator.evaluate("el => el.tagName", timeout=2000)).upper()
+    except Exception:  # noqa: BLE001
+        tag = ""
+    if tag == "INPUT":
+        typed = _norm_ws(normalized)
+        page.keyboard.type(typed, delay=30)
+        return typed
+    lines = normalized.split("\n")
+    for i, line in enumerate(lines):
+        if line:
+            page.keyboard.type(line, delay=30)
+        if i < len(lines) - 1:
+            page.keyboard.press("Shift+Enter")
+    return normalized
+
+
+def _visible_now(page: Any, sel: str) -> bool:
+    """One-shot, no-wait: is there a visible match for `sel` (page or child frame)?"""
+    try:
+        if page.locator(_ensure_visible_sel(sel)).count() > 0:
+            return True
+        return _find_in_frames(page, _ensure_visible_sel(sel)) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _chat_already_open(page: Any, config: "BrowserConfig") -> bool:  # type: ignore[name-defined]
+    """True if the chat input is already visible, i.e. the launcher must NOT be
+    clicked again. Clicking every round breaks widgets whose launcher hides
+    once open (the wait for it times out) or toggles (the click closes the
+    chat). Only an explicit or already-detected input selector can vouch for
+    this; with neither, the launcher is clicked as before."""
+    candidates = []
+    if config.input_selector and config.input_selector.strip():
+        candidates.append(config.input_selector.strip())
+    cached_input = (_SELECTOR_CACHE.get(config.session_key) or {}).get("input")
+    if cached_input:
+        candidates.append(cached_input)
+    return any(_visible_now(page, sel) for sel in candidates)
+
+
+# ==========================================================================
 # Login helper
 # ==========================================================================
 def _do_login(page: Any, config: "BrowserConfig") -> None:  # type: ignore[name-defined]
@@ -1654,6 +2126,7 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
 
     # ---- Open chatbot page -----------------------------------------------
     start = time.perf_counter()
+    message_sent = False  # flipped once the send is verified; see the except below
 
     try:
         current_url = page.url
@@ -1694,7 +2167,7 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
         # otherwise time out waiting for something that doesn't exist yet.
         # Only done once per page (each call opens a fresh page, so this
         # runs on every round — cheap, and idempotent if already open).
-        if config.chat_launcher_selector:
+        if config.chat_launcher_selector and not _chat_already_open(page, config):
             try:
                 launcher_locator = _wait_for_selector_with_frames(
                     page, config.chat_launcher_selector, timeout_ms, state="visible"
@@ -1752,26 +2225,14 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
                 f"{_selector_diagnostic(page, input_sel)}: {e}"
             ) from e
 
-        # Capture existing response text (for text_change detection) or DOM node (for new_element).
-        # Also checks child frames — a one-shot fallback, no wait.
-        existing_response_text = ""
+        # Snapshot the response area BEFORE sending: how many matches exist, the
+        # last one's text, and (new_element) which DOM node it is. "New reply" is
+        # judged against this in _wait_for_response_text(). No-wait, frame-aware.
+        before_count, before_text = 0, ""
         try:
-            if config.wait_strategy == "text_change":
-                # Snapshot the LAST visible element — chat UIs append at the bottom
-                loc = page.locator(response_sel)
-                cnt = loc.count()
-                el_snap = loc.last if cnt > 0 else (page.query_selector(response_sel) or _query_in_frames(page, response_sel))
-                existing_response_text = ""
-                if el_snap:
-                    try:
-                        existing_response_text = el_snap.inner_text() or ""
-                    except Exception:  # noqa: BLE001
-                        existing_response_text = ""
-            elif config.wait_strategy == "new_element":
-                try:
-                    page.locator(response_sel).evaluate("el => { window._evalmind_last_node = el; }")
-                except Exception:  # noqa: BLE001
-                    page.evaluate("() => { window._evalmind_last_node = null; }")
+            before_count, _snap_text = _read_last_response(page, response_sel)
+            before_text = _snap_text.strip()
+            _mark_last_response_node(page, response_sel)
         except Exception:  # noqa: BLE001
             pass
 
@@ -1780,7 +2241,7 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
             input_locator.click()
             page.keyboard.press("Control+A")
             page.keyboard.press("Backspace")
-            page.keyboard.type(task, delay=30)
+            typed_text = _type_task(page, input_locator, task)
         except Exception as e:  # noqa: BLE001
             _debug_screenshot(page, "09_type_failed")
             raise BrowserSelectorError(
@@ -1853,7 +2314,7 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
         cleared = False
         clear_deadline = time.perf_counter() + 3.0
         while time.perf_counter() < clear_deadline:
-            if task not in _current_input_text():
+            if _norm_ws(typed_text) not in _norm_ws(_current_input_text()):
                 cleared = True
                 break
             page.wait_for_timeout(150)
@@ -1877,105 +2338,62 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
                 f"instead of relying on auto-detection/the Enter fallback."
             )
 
+        # From here on the message is out: an error after this point must NOT be
+        # retried by re-typing it (call_aut_with_retry checks message_sent).
+        message_sent = True
+
         # ---- Wait for response -------------------------------------------
         response_text = ""
 
-        if config.wait_strategy == "new_element":
-            # Wait for a strictly NEW DOM node matching response_selector to appear. 
-            # Because we no longer force a hard reload between rounds, the OLD response 
-            # from the previous round might already be in the DOM.
-            try:
-                deadline = time.perf_counter() + config.wait_timeout_seconds
-                found = False
-                while time.perf_counter() < deadline:
-                    try:
-                        is_new = page.locator(response_sel).evaluate("el => el !== window._evalmind_last_node")
-                        if is_new:
-                            found = True
-                            break
-                    except Exception:  # noqa: BLE001
-                        pass
-                    page.wait_for_timeout(100)
-                    
-                if not found:
-                    raise TimeoutError(f"No new DOM node for '{response_sel}' appeared")
-                    
-                response_locator = _wait_for_selector_with_frames(page, response_sel, timeout_ms)
-                response_text = response_locator.inner_text() or ""
-            except Exception as e:  # noqa: BLE001
+        if config.wait_strategy in ("new_element", "text_change"):
+            # Both strategies share one detector (see _wait_for_response_text):
+            #   new_element -- a strictly NEW node (or one more match) must appear;
+            #   text_change -- additionally accepts the last node's text changing.
+            # Either way the candidate must not be the user's own echoed message
+            # or a "Typing..." placeholder, and must stay unchanged briefly.
+            require_new_node = config.wait_strategy == "new_element"
+            found_text = _wait_for_response_text(
+                page,
+                response_sel,
+                task,
+                before_count,
+                before_text,
+                require_new_node=require_new_node,
+                timeout_s=config.wait_timeout_seconds,
+            )
+            if found_text is None:
                 _debug_screenshot(page, "10_response_wait_failed")
-                raise BrowserTimeoutError(
-                    f"[{_classify_error(e)}] browser: response selector '{response_sel}' "
-                    f"did not appear within {config.wait_timeout_seconds}s"
-                    f"{_selector_diagnostic(page, response_sel)}. Still on: {page.url!r}. Error: {e}"
-                ) from e
-
-        elif config.wait_strategy == "text_change":
-            # Poll until inner_text of response_selector changes AND stays
-            # unchanged for at least STABILITY_WINDOW_SECONDS.
-            #
-            # This used to accept the FIRST read that merely differed from
-            # existing_response_text — a single differing read is a real
-            # correctness gap for any UI that mutates the response node more
-            # than once (e.g. shows a "typing…"/streaming partial, then
-            # replaces it with the final text): the partial would get
-            # captured and scored as if it were the finished answer. Now a
-            # candidate text has to be read as unchanged across consecutive
-            # polls spanning at least STABILITY_WINDOW_SECONDS before it's
-            # accepted — a genuinely-finished response naturally satisfies
-            # this within one extra poll cycle; a still-streaming one keeps
-            # resetting the stability clock every time it mutates.
-            STABILITY_WINDOW_SECONDS = 1.0
-            deadline = time.perf_counter() + config.wait_timeout_seconds
-            found = False
-            last_seen_text: Optional[str] = None
-            stable_since: Optional[float] = None
-            while time.perf_counter() < deadline:
-                try:
-                    # IMPORTANT: use .last, not .first or query_selector (which returns the first DOM match).
-                    # Chat UIs append new responses at the END of the message list.
-                    # Watching the first match means we're always looking at the oldest message,
-                    # which never changes after the first round.
-                    locator = page.locator(response_sel)
-                    count = locator.count()
-                    el_handle = locator.last if count > 0 else None
-                    if el_handle is None:
-                        # Try child frames as fallback
-                        el_handle = _query_in_frames(page, response_sel)
-                    if el_handle:
-                        try:
-                            text = el_handle.inner_text()
-                        except Exception:  # noqa: BLE001
-                            text = ""
-                        if text and text != existing_response_text:
-                            if text != last_seen_text:
-                                last_seen_text = text
-                                stable_since = time.perf_counter()
-                            elif (
-                                stable_since is not None
-                                and (time.perf_counter() - stable_since) >= STABILITY_WINDOW_SECONDS
-                            ):
-                                response_text = text
-                                found = True
-                                break
-                except Exception:  # noqa: BLE001
-                    pass
-                page.wait_for_timeout(500)
-
-            if not found:
-                _debug_screenshot(page, "10_response_wait_failed")
+                if require_new_node:
+                    raise BrowserTimeoutError(
+                        f"browser: response selector '{response_sel}' did not appear within "
+                        f"{config.wait_timeout_seconds}s (no new, finished bot reply was seen)"
+                        f"{_selector_diagnostic(page, response_sel)}. Still on: {page.url!r}."
+                    )
                 raise BrowserTimeoutError(
                     f"browser: response text did not change within "
                     f"{config.wait_timeout_seconds}s (selector: '{response_sel}')"
                     f"{_selector_diagnostic(page, response_sel)}. Still on: {page.url!r}. "
                     f"The chatbot may still be generating or the selector is wrong."
                 )
+            response_text = found_text
 
         elif config.wait_strategy == "fixed_delay":
             page.wait_for_timeout(int(config.fixed_delay_seconds * 1000))
             try:
                 el = page.query_selector(response_sel) or _query_in_frames(page, response_sel)
                 response_text = el.inner_text() if el else ""
+                if response_text:
+                    # Same logic as _wait_for_response_text: if the whole container was read
+                    current_count = page.locator(response_sel).count() if not _query_in_frames(page, response_sel) else 1
+                    if current_count == before_count and before_text:
+                        if response_text.startswith(before_text):
+                            response_text = response_text[len(before_text):].strip()
+                        else:
+                            idx = response_text.rfind(task.strip()[:20])
+                            if idx != -1:
+                                response_text = response_text[idx:].strip()
+                        response_text = _strip_task(response_text, task)
+                    response_text = _clean_ui_metadata(response_text)
             except Exception as e:  # noqa: BLE001
                 _debug_screenshot(page, "10_response_wait_failed")
                 raise BrowserSelectorError(
@@ -1985,8 +2403,22 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
 
         latency_ms = (time.perf_counter() - start) * 1000
 
-    finally:
-        pass
+    except Exception as _err:  # noqa: BLE001
+        # Tag every failure with whether the message had already been sent, so
+        # call_aut_with_retry() never re-types (duplicates) an already-sent
+        # question; wrap raw Playwright errors so callers only ever see
+        # AUTConnectorError subclasses (and can retry them when it is safe).
+        if not isinstance(_err, AUTConnectorError):
+            _wrapped = BrowserTransientError(
+                f"[{_classify_error(_err)}] browser: unexpected error while talking to "
+                f"'{config.chatbot_url}': {_err}"
+            )
+            _wrapped.message_sent = message_sent  # type: ignore[attr-defined]
+            if _classify_error(_err) == "TargetClosedError":
+                close_session(config)  # dead browser: let the next attempt start a fresh one
+            raise _wrapped from _err
+        _err.message_sent = message_sent  # type: ignore[attr-defined]
+        raise
 
     if not response_text.strip():
         raise AUTConnectorError(

@@ -39,7 +39,7 @@ and it's also what lets tests/test_describer.py isolate "does auto-discovery
 work" from "does the escalating loop work" as separate concerns.
 """
 import uuid
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel
 
@@ -47,7 +47,7 @@ from aggregator import FinalReport, build_final_report
 from agents.describer import describe_aut
 from agents.schemas import DescriberResult
 from aut.connector import AUTConfig
-from db.store import init_db, insert_session
+from db.store import get_rounds_for_session, init_db, insert_session, update_session_description
 from loop_runner import CategoryLoopResult, run_category_loop
 from progress import OnEvent, emit_event
 
@@ -57,6 +57,25 @@ _STATUS_LABELS = {
     "broken": "BROKEN",
     "robust_within_tested_range": "ROBUST (within tested range)",
 }
+
+# Session row description used between session creation and the Describer
+# finishing (the row is now created BEFORE discovery so a run that dies during
+# discovery still leaves a trace in the DB / history panel).
+_DISCOVERY_PENDING_DESCRIPTION = "(auto-discovery in progress...)"
+
+# If this many categories in a row abort with an error, the AUT (or the LLM
+# provider) is assumed to be down and the remaining categories are skipped
+# instead of each burning its own full round of timeouts.
+MAX_CONSECUTIVE_CATEGORY_FAILURES = 2
+
+
+def _mark_session_failed(session_id: str, message: str) -> None:
+    """Best-effort: record why a session died before it produced any rounds,
+    by overwriting its placeholder description. Never raises."""
+    try:
+        update_session_description(session_id, message[:300])
+    except Exception:  # noqa: BLE001 - diagnostics must never mask the real error
+        pass
 
 
 class SessionResult(BaseModel):
@@ -75,6 +94,10 @@ class SessionResult(BaseModel):
     describer_result: Optional[DescriberResult] = None
     summaries: Dict[str, CategoryLoopResult]
     final_report: FinalReport
+    # Categories whose loop was cut short by an error (partial run). Empty for
+    # a normal, complete run. Their rounds so far are still in the DB and the
+    # final_report, just not in `summaries`.
+    failed_categories: List[str] = []
 
 
 def run_full_session(
@@ -157,49 +180,89 @@ def run_full_session(
     # compare for them — effectively free.
     try:
         describer_result: Optional[DescriberResult] = None
+        session_id = str(uuid.uuid4())
         if capability_description_override is not None:
             if not capability_description_override.strip():
                 raise ValueError("capability_description_override must be a non-empty string if provided")
             capability_description = capability_description_override
+            insert_session(session_id, aut_description=capability_description)
         else:
-            # Describer runs BEFORE the session row is created - the session's
-            # aut_description is only ever written once the real description is
-            # known, auto-discovered or not.
-            describer_result = describe_aut(aut_config, on_event=on_event)
+            # The session row is created BEFORE the Describer runs (with a
+            # placeholder description) so a run that dies during discovery still
+            # leaves a trace in the DB and the history panel instead of nothing
+            # at all; the real description replaces the placeholder below.
+            insert_session(session_id, aut_description=_DISCOVERY_PENDING_DESCRIPTION)
+            try:
+                describer_result = describe_aut(aut_config, on_event=on_event)
+            except Exception as e:
+                _mark_session_failed(session_id, f"[auto-discovery failed] {e}")
+                raise
             capability_description = describer_result.capability_description
-
-        session_id = str(uuid.uuid4())
-        insert_session(session_id, aut_description=capability_description)
+            update_session_description(session_id, capability_description)
 
         active_categories = categories if categories else list(CATEGORIES)
 
         summaries: Dict[str, CategoryLoopResult] = {}
+        failed_categories: List[str] = []
+        first_error: Optional[Exception] = None
+        consecutive_failures = 0
         for category in CATEGORIES:
             if category not in active_categories:
                 continue
-            summaries[category] = run_category_loop(
-                category=category,
-                capability_description=capability_description,
-                aut_config=aut_config,
-                max_rounds=max_rounds,
-                session_id=session_id,
-                on_event=on_event,
-                start_difficulty=start_difficulty,
-                max_difficulty=max_difficulty,
-                pass_threshold=pass_threshold,
-            )
+            # One category blowing up (AUT timeout, LLM hiccup, ...) must not
+            # throw away every round already completed: previously any
+            # exception here aborted the whole session with no report at all.
+            # Rounds already written to the DB are kept and reported on.
+            try:
+                summaries[category] = run_category_loop(
+                    category=category,
+                    capability_description=capability_description,
+                    aut_config=aut_config,
+                    max_rounds=max_rounds,
+                    session_id=session_id,
+                    on_event=on_event,
+                    start_difficulty=start_difficulty,
+                    max_difficulty=max_difficulty,
+                    pass_threshold=pass_threshold,
+                )
+                consecutive_failures = 0
+            except Exception as e:  # noqa: BLE001 - deliberately broad; see comment above
+                # run_single_round() has already fired an "error" event with the
+                # failing stage (generator/aut/judge) for the realistic cases.
+                failed_categories.append(category)
+                if first_error is None:
+                    first_error = e
+                consecutive_failures += 1
+                print(f"  [session] category {category!r} aborted: {type(e).__name__}: {e}")
+                if consecutive_failures >= MAX_CONSECUTIVE_CATEGORY_FAILURES:
+                    print(
+                        f"  [session] {consecutive_failures} categories in a row failed -- "
+                        f"the AUT/LLM looks unavailable, skipping any remaining categories."
+                    )
+                    break
+
+        # If nothing at all was recorded there is nothing to report on: surface
+        # the original failure exactly as an un-guarded run always did.
+        if first_error is not None and not get_rounds_for_session(session_id):
+            raise first_error
 
         # Block G: one call builds AND persists the FinalReport, from the DB
         # rows every category loop just wrote - `summaries` is passed only as a
         # diagnostic cross-check, never as the source of report data (see
         # aggregator.build_final_report's docstring).
         try:
-            final_report = build_final_report(session_id, category_summaries=summaries)
+            final_report = build_final_report(
+                session_id,
+                category_summaries=summaries,
+                incomplete_categories=failed_categories,
+            )
         except Exception as e:
             emit_event(on_event, "error", {"stage": "aggregator", "message": str(e)})
             raise
 
-        _print_session_report(session_id, capability_description, summaries, final_report, describer_result)
+        _print_session_report(
+            session_id, capability_description, summaries, final_report, describer_result, failed_categories
+        )
 
         emit_event(on_event, "session_completed", final_report.model_dump())
 
@@ -209,6 +272,7 @@ def run_full_session(
             describer_result=describer_result,
             summaries=summaries,
             final_report=final_report,
+            failed_categories=failed_categories,
         )
     finally:
         if getattr(aut_config, "mode", None) == "browser":
@@ -288,7 +352,9 @@ def _print_session_report(
     summaries: Dict[str, CategoryLoopResult],
     final_report: FinalReport,
     describer_result: Optional[DescriberResult] = None,
+    failed_categories: Optional[List[str]] = None,
 ) -> None:
+    failed_categories = failed_categories or []
     width = 78
     print("=" * width)
     print("EvalMind - Session Report")
@@ -306,7 +372,31 @@ def _print_session_report(
     _print_overall_verdict_section(final_report, width)
 
     for category in CATEGORIES:
-        summary = summaries[category]
+        # Only categories that actually completed have a summary: a subset
+        # selection (categories=[...]) or an aborted category has none.
+        # Indexing summaries[category] unconditionally used to raise KeyError
+        # here AFTER the report was already saved, so session_completed never
+        # fired for any run that didn't cover all three categories.
+        summary = summaries.get(category)
+        if summary is None:
+            cat_report = final_report.categories.get(category)
+            if category in failed_categories and cat_report is not None:
+                print("-" * width)
+                print(f"{category.upper():<14} status: INCOMPLETE (run cut short by an error)")
+                print("-" * width)
+                for entry in cat_report.round_history:
+                    verdict = "PASS" if entry.passed else "FAIL"
+                    print(
+                        f"    R{entry.round_number} (difficulty {entry.difficulty}) {verdict:<4} "
+                        f"tc={entry.task_completion} sec={entry.security} comp={entry.compliance}"
+                    )
+                print()
+            elif category in failed_categories:
+                print("-" * width)
+                print(f"{category.upper():<14} status: FAILED before any round completed")
+                print("-" * width)
+                print()
+            continue
         label = _STATUS_LABELS.get(summary.status, summary.status.upper())
         print("-" * width)
         print(f"{category.upper():<14} status: {label:<28} breaking point: {_breaking_point_label(summary)}")
@@ -320,9 +410,12 @@ def _print_session_report(
     _print_performance_and_cost_section(final_report, width)
 
     print("=" * width)
-    broken = [c for c in CATEGORIES if summaries[c].status == "broken"]
+    broken = [c for c in CATEGORIES if c in summaries and summaries[c].status == "broken"]
+    tested = len(summaries)
     if broken:
-        print(f"Summary: {len(broken)}/3 categories broke within the tested range: {', '.join(broken)}")
+        print(f"Summary: {len(broken)}/{tested} categories broke within the tested range: {', '.join(broken)}")
     else:
-        print("Summary: all 3 categories remained robust within the tested range.")
+        print(f"Summary: all {tested} categories remained robust within the tested range.")
+    if failed_categories:
+        print(f"WARNING: partial run - category(ies) cut short by an error: {', '.join(failed_categories)}")
     print("=" * width)

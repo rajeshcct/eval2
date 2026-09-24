@@ -90,6 +90,9 @@ export interface CategoryReport {
   breaking_point_round: number | null;
   breaking_point_summary: string | null;
   round_history: RoundHistoryEntry[];
+  /** True when this category's loop was cut short by an error (partial run).
+   * Optional: absent on reports stored before this field existed. */
+  incomplete?: boolean;
 }
 
 /** Mirrors aggregator.py::PerformanceAndCost. */
@@ -118,6 +121,8 @@ export interface FinalReport {
   overall_verdict: string;
   categories: Record<string, CategoryReport>;
   performance_and_cost: PerformanceAndCost;
+  /** Categories cut short by an error (partial run). Optional/absent on older reports. */
+  incomplete_categories?: string[];
 }
 
 // ==========================================================================

@@ -915,17 +915,23 @@ def call_aut_with_retry(
             BrowserAutoDetectError,
             BrowserSelectorError,
             BrowserTimeoutError,
+            BrowserTransientError,
         )
     except Exception:  # noqa: BLE001 - playwright not installed; nothing to retry against
         return call_aut(task, config, on_event=on_event)
 
-    retriable = (BrowserAutoDetectError, BrowserSelectorError, BrowserTimeoutError)
+    retriable = (BrowserAutoDetectError, BrowserSelectorError, BrowserTimeoutError, BrowserTransientError)
 
     last_error: Optional[Exception] = None
     for attempt in range(1, max(1, attempts) + 1):
         try:
             return call_aut(task, config, on_event=on_event)
         except retriable as e:  # noqa: BLE001 - intentionally narrow, see module note above
+            # Once the message has been sent (call_browser_aut tags the error),
+            # retrying would type it AGAIN -- a duplicate chat message the bot
+            # answers twice. Only failures before the send are safe to retry.
+            if getattr(e, "message_sent", False):
+                raise
             last_error = e
             if attempt < attempts:
                 print(

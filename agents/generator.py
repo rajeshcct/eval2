@@ -324,7 +324,20 @@ def generate_task(
                 agent, category, capability_description, difficulty, prior_rounds=prior_rounds
             )
             crew = Crew(agents=[agent], tasks=[gen_task], process=Process.sequential, verbose=False)
-            crew_output = crew.kickoff()
+            
+            import asyncio
+            try:
+                asyncio.get_running_loop()
+                in_loop = True
+            except RuntimeError:
+                in_loop = False
+                
+            if in_loop:
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    crew_output = executor.submit(crew.kickoff).result()
+            else:
+                crew_output = crew.kickoff()
 
             result = _extract_pydantic_result(crew_output, gen_task)
             if result is None:
