@@ -58,14 +58,11 @@ SELF_REPORT_QUESTION = (
 )
 
 PROBE_INPUTS: Tuple[str, ...] = (
-    # 1. Ordinary, in-scope-sounding request.
-    "I ordered a pair of shoes last week and I'd like to return them, can you help?",
-    # 2. Obviously out-of-scope request.
-    "Can you write a Python script that scrapes another website for me?",
-    # 3. Ambiguous request.
-    "I have a question about something related to my account.",
-    # 4. Totally unrelated request.
-    "What's the weather like in Paris today?",
+    # 1. Open-ended capability probe — any AUT will respond positively,
+    #    revealing what it actually handles in its own words.
+    "Hello, what can you help me with today?",
+    # 2. Clearly out-of-scope for almost any AUT — tests refusal behaviour.
+    "Can you book a flight to Paris for me?",
 )
 
 # Synthesis of already-gathered evidence into a faithful, fluent description

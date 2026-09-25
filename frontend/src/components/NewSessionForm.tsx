@@ -55,7 +55,7 @@ interface NewSessionFormProps {
  * landing page without needing to hand-edit a URL.
  */
 export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewSessionFormProps) {
-  const [connectionMode, setConnectionMode] = useState<"http" | "socketio" | "direct_http" | "public_api" | "swagger" | "browser">(
+  const [connectionMode, setConnectionMode] = useState<"http" | "socketio" | "swagger" | "browser">(
     "http",
   );
   const [connection, setConnection] = useState<AUTConnectionRequest>(defaultAUTConnectionRequest());
@@ -271,18 +271,7 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
             >
               HTTP / REST
             </button>
-            <button
-              type="button"
-              onClick={() => setConnectionMode("direct_http")}
-              aria-pressed={connectionMode === "direct_http"}
-              className={`flex-1 rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
-                connectionMode === "direct_http"
-                  ? "border-indigo-500 bg-indigo-600/20 text-indigo-200"
-                  : "border-slate-700 bg-slate-900 text-slate-300 hover:bg-slate-800"
-              }`}
-            >
-              HTTP (No Login)
-            </button>
+
             <button
               type="button"
               onClick={() => setConnectionMode("socketio")}
@@ -295,18 +284,7 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
             >
               Socket.IO (JWT)
             </button>
-            <button
-              type="button"
-              onClick={() => setConnectionMode("public_api")}
-              aria-pressed={connectionMode === "public_api"}
-              className={`flex-1 rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
-                connectionMode === "public_api"
-                  ? "border-indigo-500 bg-indigo-600/20 text-indigo-200"
-                  : "border-slate-700 bg-slate-900 text-slate-300 hover:bg-slate-800"
-              }`}
-            >
-              Public API (LLM)
-            </button>
+
             <button
               type="button"
               onClick={() => setConnectionMode("swagger")}
@@ -411,109 +389,9 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
           </>
         )}
 
-        {connectionMode === "direct_http" && (
-          <>
-            <div className="flex flex-col gap-2">
-              <label htmlFor="direct_chat_endpoint_url" className="text-sm font-medium text-slate-200">
-                Chat endpoint URL
-              </label>
-              <input
-                id="direct_chat_endpoint_url"
-                type="text"
-                required
-                placeholder="https://demo-ai-api.notchzero.com/generate_response"
-                value={directHttpConnection.chat_endpoint_url}
-                onChange={(e) => updateDirectHttpConnection("chat_endpoint_url", e.target.value)}
-                className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              />
-            </div>
 
-            <div className="flex flex-col gap-2">
-              <label htmlFor="task_field" className="text-sm font-medium text-slate-200">
-                Request body field name
-              </label>
-              <input
-                id="task_field"
-                type="text"
-                placeholder="task"
-                value={directHttpConnection.task_field}
-                onChange={(e) => updateDirectHttpConnection("task_field", e.target.value)}
-                className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              />
-              <p className="text-xs text-slate-500">
-                The JSON key sent to the API (e.g. <code className="text-slate-400">task</code> or{" "}
-                <code className="text-slate-400">user_input</code>). Check the API docs.
-              </p>
-            </div>
-          </>
-        )}
 
-        {connectionMode === "public_api" && (
-          <>
-            <div className="flex flex-col gap-2">
-              <label htmlFor="public_api_system_prompt" className="text-sm font-medium text-slate-200">
-                System prompt
-              </label>
-              <textarea
-                id="public_api_system_prompt"
-                required
-                rows={4}
-                placeholder="You are a helpful customer support assistant for Acme Co..."
-                value={publicApiConnection.system_prompt}
-                onChange={(e) => updatePublicApiConnection("system_prompt", e.target.value)}
-                className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              />
-              <p className="text-xs text-slate-500">
-                The AUT isn't a deployed endpoint here — it's this system prompt plus the model below,
-                called directly.
-              </p>
-            </div>
 
-            <div className="flex flex-col gap-2">
-              <label htmlFor="public_api_model" className="text-sm font-medium text-slate-200">
-                Model
-              </label>
-              <input
-                id="public_api_model"
-                type="text"
-                required
-                placeholder="groq/llama-3.1-8b-instant"
-                value={publicApiConnection.model}
-                onChange={(e) => updatePublicApiConnection("model", e.target.value)}
-                className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              />
-              <p className="text-xs text-slate-500">
-                A CrewAI model string, e.g. <code className="text-slate-400">groq/llama-3.1-8b-instant</code>,{" "}
-                <code className="text-slate-400">openai/gpt-4o-mini</code>, or{" "}
-                <code className="text-slate-400">anthropic/claude-3-5-sonnet-20241022</code>. The provider's API
-                key comes from the backend's own <code className="text-slate-400">.env</code> — nothing to
-                enter here.
-              </p>
-            </div>
-
-            <div className="flex flex-col gap-2">
-              <label htmlFor="public_api_temperature" className="text-sm font-medium text-slate-200">
-                Temperature <span className="text-slate-500">(optional)</span>
-              </label>
-              <input
-                id="public_api_temperature"
-                type="number"
-                min={0}
-                max={2}
-                step={0.1}
-                placeholder="Provider default"
-                value={publicApiConnection.temperature ?? ""}
-                onChange={(e) =>
-                  updatePublicApiConnection(
-                    "temperature",
-                    e.target.value.trim() ? Number(e.target.value) : undefined,
-                  )
-                }
-                className="w-32 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              />
-            </div>
-          </>
-        )}
 
         {connectionMode === "swagger" && (
           <>

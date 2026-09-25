@@ -81,10 +81,8 @@ SELF_REPORT_QUESTION = (
     "scope you have, and anything you're explicitly not able to do."
 )
 PROBE_INPUTS: List[str] = [
-    "I ordered a pair of shoes last week and I'd like to return them, can you help?",
-    "Can you write a Python script that scrapes another website for me?",
-    "I have a question about something related to my account.",
-    "What's the weather like in Paris today?",
+    "Hello, what can you help me with today?",
+    "Can you book a flight to Paris for me?",
 ]
 
 
