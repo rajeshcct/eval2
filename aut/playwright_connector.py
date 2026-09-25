@@ -80,6 +80,10 @@ class BrowserTransientError(AUTConnectorError):
     subclasses (and so the retry wrapper in aut/connector.py can cover them)."""
 
 
+class BrowserLoginWallError(AUTConnectorError):
+    """The chatbot stopped answering and showed a login or paywall prompt instead."""
+
+
 # Selector-detection LLM calls get their own short, fail-fast timeout and a
 # hard wall-clock budget for the whole auto_detect_selectors() sequence —
 # previously neither existed: the LLM call itself had no timeout (falling
@@ -1907,6 +1911,17 @@ def _extract_response_from_page_transcript(
 
     response_raw = response_raw.strip()
     response_raw = _clean_ui_metadata(response_raw)
+    
+    if not response_raw:
+        # Check if we hit a paywall/login wall
+        lower_text = final_text.lower()
+        login_cues = ["sign up", "log in", "login", "create an account", "message limit"]
+        if any(cue in lower_text for cue in login_cues):
+            raise BrowserLoginWallError(
+                "We were only able to test your chatbot up to this point because it hit a free-tier limit or login wall. "
+                "Please provide credentials for a detailed report."
+            )
+            
     print(
         f"[browser debug] page-transcript fallback: extracted {len(response_raw)} chars "
         f"(baseline={baseline_len}, final={len(final_text)})."
@@ -2390,6 +2405,20 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
         try:
             input_locator = _wait_for_selector_with_frames(page, input_sel, timeout_ms)
         except Exception as e:  # noqa: BLE001
+            try:
+                final_text = page.evaluate("() => document.body.innerText") or ""
+                lower_text = final_text.lower()
+                login_cues = ["sign up", "log in", "login", "create an account", "message limit", "reached your limit"]
+                if any(cue in lower_text for cue in login_cues):
+                    raise BrowserLoginWallError(
+                        "We were only able to test your chatbot up to this point because it hit a free-tier limit or login wall. "
+                        "Please provide credentials for a detailed report."
+                    )
+            except BrowserLoginWallError:
+                raise
+            except Exception:
+                pass
+
             _debug_screenshot(page, "08_input_not_found")
             raise BrowserSelectorError(
                 f"[{_classify_error(e)}] browser: input selector '{input_sel}' not found "
@@ -2421,11 +2450,25 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
 
         # Click input and type the task.
         try:
-            input_locator.click()
+            input_locator.click(timeout=10000) # shorter timeout here to prevent endless scrolling
             page.keyboard.press("Control+A")
             page.keyboard.press("Backspace")
             typed_text = _type_task(page, input_locator, task)
         except Exception as e:  # noqa: BLE001
+            try:
+                final_text = page.evaluate("() => document.body.innerText") or ""
+                lower_text = final_text.lower()
+                login_cues = ["sign up", "log in", "login", "create an account", "message limit", "reached your limit"]
+                if any(cue in lower_text for cue in login_cues):
+                    raise BrowserLoginWallError(
+                        "We were only able to test your chatbot up to this point because it hit a free-tier limit or login wall. "
+                        "Please provide credentials for a detailed report."
+                    )
+            except BrowserLoginWallError:
+                raise
+            except Exception:
+                pass
+
             _debug_screenshot(page, "09_type_failed")
             raise BrowserSelectorError(
                 f"[{_classify_error(e)}] browser: could not type into input "
@@ -2556,6 +2599,21 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
                 timeout_s=config.wait_timeout_seconds,
             )
             if found_text is None:
+                # Check for login/paywall before assuming a normal timeout
+                try:
+                    final_text = page.evaluate("() => document.body.innerText") or ""
+                    lower_text = final_text.lower()
+                    login_cues = ["sign up", "log in", "login", "create an account", "message limit"]
+                    if any(cue in lower_text for cue in login_cues):
+                        raise BrowserLoginWallError(
+                            "We were only able to test your chatbot up to this point because it hit a free-tier limit or login wall. "
+                            "Please provide credentials for a detailed report."
+                        )
+                except BrowserLoginWallError:
+                    raise
+                except Exception:
+                    pass
+
                 _debug_screenshot(page, "10_response_wait_failed")
                 if require_new_node:
                     raise BrowserTimeoutError(

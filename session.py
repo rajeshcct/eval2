@@ -256,6 +256,15 @@ def run_full_session(
                 category_summaries=summaries,
                 incomplete_categories=failed_categories,
             )
+            # Surface the login wall message loudly in the final report
+            if first_error and type(first_error).__name__ == "BrowserLoginWallError":
+                wall_msg = (
+                    "⚠️ EVALUATION HALTED: We were only able to test your chatbot up to this point "
+                    "because it hit a free-tier limit or login wall. Please provide credentials "
+                    "(or a logged-in browser session) for a detailed report.\n\n"
+                )
+                final_report.overall_verdict = wall_msg + final_report.overall_verdict
+                
         except Exception as e:
             emit_event(on_event, "error", {"stage": "aggregator", "message": str(e)})
             raise
