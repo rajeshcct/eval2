@@ -309,7 +309,7 @@ def _clean_selector(raw: str) -> str:
 
 
 _SELECTOR_LINE_RE = re.compile(
-    r"^\s*(INPUT|SEND|RESPONSE|LAUNCHER)[_ ]?SELECTOR\s*:\s*(.*)$",
+    r"^\s*(INPUT|SEND|RESPONSE|LAUNCHER|USERNAME|PASSWORD|SUBMIT)[_ ]?SELECTOR\s*:\s*(.*)$",
     re.IGNORECASE,
 )
 
@@ -1416,23 +1416,38 @@ _LOGIN_USERNAME_CANDIDATES = [
     "input[name='email']",
     "input[name='user']",
     "input[name='login']",
+    "input[name='userName']",
+    "input[name='loginId']",
+    "input[name='userId']",
     "input[type='email']",
     "input[id*='username' i]",
     "input[id*='email' i]",
     "input[id*='user' i]",
+    "input[id*='login' i]",
     "input[placeholder*='email' i]",
     "input[placeholder*='username' i]",
     "input[placeholder*='user' i]",
+    "input[placeholder*='login' i]",
+    "input[placeholder*='enter your email' i]",
     "input[autocomplete='username']",
     "input[autocomplete='email']",
+    "[data-testid*='email' i]",
+    "[data-testid*='username' i]",
+    "[data-testid*='login' i]",
+    # Catch-all: first visible text input inside a form
+    "form input[type='text']:first-of-type",
 ]
 
 _LOGIN_PASSWORD_CANDIDATES = [
     "input[type='password']",   # always the most reliable — standard HTML
     "input[name='password']",
+    "input[name='passwd']",
+    "input[name='pass']",
     "input[id*='password' i]",
     "input[placeholder*='password' i]",
+    "input[placeholder*='enter your password' i]",
     "input[autocomplete='current-password']",
+    "[data-testid*='password' i]",
 ]
 
 _LOGIN_SUBMIT_CANDIDATES = [
@@ -1445,8 +1460,18 @@ _LOGIN_SUBMIT_CANDIDATES = [
     "button[name='login']",
     "button[id*='login' i]",
     "button[id*='signin' i]",
+    "button[id*='sign-in' i]",
     "button[class*='login' i]",
     "button[class*='signin' i]",
+    "button[class*='sign-in' i]",
+    "button:has-text('Sign in')",
+    "button:has-text('Log in')",
+    "button:has-text('Login')",
+    "button:has-text('Continue')",
+    "button:has-text('Submit')",
+    "[data-testid*='login' i]",
+    "[data-testid*='signin' i]",
+    "[data-testid*='submit' i]",
     "form button:last-of-type",
 ]
 
@@ -1478,52 +1503,73 @@ def _auto_detect_login_selectors(page: Any, login_url: str) -> dict[str, str]:
     if missing:
         print(f"[browser debug] Login heuristics missed {missing}, falling back to LLM HTML analysis...")
         try:
-            clean_html = page.evaluate('''() => {
-                let clone = document.body.cloneNode(true);
-                clone.querySelectorAll('script, style, svg, path, img, video, iframe, noscript').forEach(el => el.remove());
-                return clone.innerHTML;
-            }''')
-            from config.llm_config import get_llm
-            llm = get_llm()
+            clean_html = _stripped_body_html(page, max_chars=15000)
+            llm = _get_llm_or_raise()
+
+            role_desc = {
+                "username": "the text input for the username, email address, or login ID",
+                "password": "the password input field",
+                "submit": "the login / sign-in submit button",
+            }
+            missing_desc = "\n".join(
+                f"- '{r}': {role_desc[r]}" for r in missing
+            )
             prompt = f"""You are a web automation expert finding CSS selectors for Playwright.
 Below is the stripped HTML of a login page at {login_url}.
-We still need CSS selectors for: {missing}
+We need CSS selectors for these login form elements:
+{missing_desc}
 
-Identify the BEST, MOST UNIQUE CSS selector for each missing element.
-- 'username': The text input for the username or email.
-- 'password': The password input.
-- 'submit': The log in or sign in submit button.
+Identify the BEST, MOST UNIQUE CSS selector for each.
+Give exactly ONE CSS selector per role — never a comma-separated list of alternatives.
 
-Respond in EXACTLY this format (one selector per line, no explanation, only for the missing ones):
+Respond in EXACTLY this format (one line per role, only for the ones listed above):
 USERNAME_SELECTOR: <selector>
 PASSWORD_SELECTOR: <selector>
 SUBMIT_SELECTOR: <selector>
 
 HTML:
-{clean_html[:30000]}"""
+{clean_html}"""
 
-            answer = llm.call(messages=[{"role": "user", "content": prompt}])
-            if not isinstance(answer, str):
-                answer = str(answer)
-                
-            for line in answer.strip().splitlines():
-                if line.startswith("USERNAME_SELECTOR:") and "username" in missing:
-                    detected["username"] = line.split(":", 1)[1].strip()
-                elif line.startswith("PASSWORD_SELECTOR:") and "password" in missing:
-                    detected["password"] = line.split(":", 1)[1].strip()
-                elif line.startswith("SUBMIT_SELECTOR:") and "submit" in missing:
-                    detected["submit"] = line.split(":", 1)[1].strip()
-                    
-            missing = [k for k in ("username", "password", "submit") if k not in detected]
-        except Exception as e:
-            from config.llm_config import MissingAPIKeyError
-            if isinstance(e, MissingAPIKeyError):
-                raise BrowserAuthError(
-                    f"LLM fallback for login selector detection cannot run: no API key is configured. "
-                    f"Set LLM_PROVIDER and the matching *_API_KEY in your .env file. Error: {e}\n\n"
-                    f"WORKAROUND: Provide username_selector, password_selector, and submit_selector "
-                    f"manually in the form's login section."
-                ) from e
+            _RETRYABLE = ("503", "529", "429", "rate limit", "overload", "unavailable", "high demand")
+            answer = None
+            for attempt in range(1, 4):
+                try:
+                    answer = llm.call(messages=[{"role": "user", "content": prompt}])
+                    break
+                except Exception as llm_err:  # noqa: BLE001
+                    err_str = str(llm_err).lower()
+                    if any(tok in err_str for tok in _RETRYABLE) and attempt < 3:
+                        wait = 5.0 * attempt
+                        print(f"[browser debug] Login LLM call failed (attempt {attempt}/3, retrying in {wait:.0f}s): {llm_err}")
+                        time.sleep(wait)
+                    else:
+                        raise
+
+            if answer is not None:
+                if not isinstance(answer, str):
+                    answer = str(answer)
+                print(f"[browser debug] Login LLM RAW ANSWER:\n{answer[:1000]}")
+
+                parsed = _parse_selector_lines(answer)
+                for role in list(missing):
+                    candidate = parsed.get(role)
+                    if not candidate:
+                        continue
+                    if _has_top_level_comma(candidate):
+                        print(f"[browser debug] Login LLM {role.upper()}_SELECTOR '{candidate}' rejected — comma-separated list")
+                        continue
+                    if not _selector_exists(page, candidate):
+                        print(f"[browser debug] Login LLM {role.upper()}_SELECTOR '{candidate}' rejected — not found in live DOM")
+                        continue
+                    detected[role] = candidate
+
+                missing = [k for k in ("username", "password", "submit") if k not in detected]
+        except BrowserAutoDetectError as e:
+            # _get_llm_or_raise surfaces a missing API key as
+            # BrowserAutoDetectError — re-wrap as BrowserAuthError since
+            # we're in the login context.
+            raise BrowserAuthError(str(e)) from e
+        except Exception as e:  # noqa: BLE001
             print(f"[browser debug] LLM HTML fallback for login failed: {e}")
 
     if missing:
@@ -2192,8 +2238,19 @@ def _do_login(page: Any, config: "BrowserConfig") -> None:  # type: ignore[name-
                 f"Error: {e}"
             ) from e
     else:
-        # Generic fallback: wait 3s for the page to settle after submit
-        page.wait_for_timeout(3000)
+        # Smart generic fallback: wait for URL change (most login forms
+        # redirect) or settle after 5s for SPAs that don't change URL.
+        pre_submit_url = page.url
+        page.wait_for_timeout(5000)
+        if page.url != pre_submit_url:
+            print(f"[browser debug] Login likely succeeded (URL changed to: {page.url!r})")
+        else:
+            print(
+                "[browser debug] Login: no success signal configured and URL "
+                "did not change after submit. Proceeding optimistically — "
+                "if the login actually failed, selector detection on the "
+                "chatbot page will surface the real error."
+            )
 
     _debug_screenshot(page, "06_login_success")
 

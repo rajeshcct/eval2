@@ -73,7 +73,7 @@ DEMO_MANUAL_FALLBACK_JSON = PROJECT_ROOT / "demo" / "manual_fallback.json"
 # Fixed discovery inputs the Describer sends through call_aut() (see
 # agents/describer.py). Duplicated here as plain string literals, rather
 # than imported from agents.describer, so this module stays pure data with
-# zero non-stdlib/non-pydantic/non-aut.connector imports — these five
+# zero non-stdlib/non-pydantic/non-aut.connector imports — these three
 # strings are also exactly what a human reading tests/sample_manual_outputs.json
 # would need to recognize as "the Describer's fixed questions" anyway.
 SELF_REPORT_QUESTION = (
