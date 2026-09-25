@@ -130,6 +130,7 @@ _SEND_CANDIDATES = [
 ]
 
 _RESPONSE_CANDIDATES = [
+    # Generic patterns
     "[data-testid*='bot-message']",
     "[data-testid*='assistant']",
     "[data-testid*='response']",
@@ -143,7 +144,26 @@ _RESPONSE_CANDIDATES = [
     "[class*='bot-message']",
     "[class*='ai-message']",
     "[role='article']",
+    # ChatGPT (chatgpt.com)
+    "[data-message-author-role='assistant']",
+    ".markdown.prose",
+    # Claude (claude.ai)
+    "[data-is-streaming='false']",
+    ".font-claude-message",
+    # Perplexity
+    ".prose",
+    # Grok / X
+    "[class*='message-bubble']",
+    # Copilot
+    "[class*='ac-container']",
 ]
+
+# Sentinel stored in the selector cache when response-container detection
+# fails entirely. When call_browser_aut() sees this sentinel for response_sel
+# it activates the "page-transcript" fallback: type + Enter, wait for the page
+# to settle, then read the full visible page text and slice out everything that
+# appears after the user's own question text to isolate the bot's reply.
+_RESPONSE_SEL_FALLBACK = "__page_transcript__"
 
 # Cache: config.session_key → {"input": sel, "send": sel, "response": sel}
 # Keyed by the UUID-based BrowserConfig.session_key (see that field's
@@ -727,6 +747,8 @@ def _start_response_llm_job(llm: Any, html: str, url: str) -> _ResponseDetectJob
 
 Find the CSS selector for the element that holds the BOT's reply messages (the latest one). Use :last-child or :last-of-type if it's a list. Do not pick a generic dashboard card, sidebar, or navbar.
 
+For standard chatbots (ChatGPT, Claude, Perplexity, Copilot, Grok, etc.), the bot's response is typically inside a container class like `.markdown`, `.prose`, `.message[data-author='assistant']`, `.agent-turn`, or similar. You MUST target the text content of the BOT's message (not the user's message, and not the entire chat history container). If messages are in a list, target the last bot message specifically.
+
 CRITICAL: Do NOT select .chat-input, input, textarea, composer, or send button. The selector MUST target a chat message bubble or bot reply element.
 
 Give exactly ONE CSS selector — never a comma-separated list of alternatives.
@@ -795,6 +817,8 @@ def _detect_input_only(page: Any, url: str) -> Optional[str]:
 
 Find the CSS selector for the TEXT INPUT / TEXTAREA where a user TYPES their chat message -- the same kind of box used at the bottom of modern AI chat apps like Claude.ai or ChatGPT: a single message-composer field (a <textarea>, an auto-growing text box, or a contenteditable div acting like one) that sits near the bottom of the chat panel, typically right next to or just above a send button, often with placeholder text like "Message...", "Ask anything", "Type a message", "Type your message...", or similar chat-style wording.
 
+Common targets for mainstream chatbots include `textarea`, elements with `contenteditable='true'` (like `.ProseMirror`), or fields with IDs/classes containing `prompt`, `composer`, `chat-input`, or `message`.
+
 It must be an editable field for composing a NEW outgoing message -- not a dropdown, a site-wide search bar, a filter box, or an input belonging to some unrelated form elsewhere on the page (login, newsletter signup, etc.).
 
 Give exactly ONE CSS selector — never a comma-separated list of alternatives.
@@ -820,7 +844,7 @@ def _detect_send_only(page: Any, url: str, input_sel: str) -> Optional[str]:
     html = _get_input_container_html(page, input_sel)
     prompt = f"""You are a web automation expert. Below is a small HTML fragment containing the chat text input for a page at {url} (its selector is '{input_sel}').
 
-Find the CSS selector for the SEND / SUBMIT button that posts this message. It should be inside or very near this fragment. Do not pick a regenerate, attach, mic, or emoji button.
+Find the CSS selector for the SEND / SUBMIT button that posts this message. It should be inside or very near this fragment. Do not pick a regenerate, attach, mic, or emoji button. Often this is a `<button>` with an `aria-label='Send message'`, an icon like a paper airplane or up-arrow, or a button with a `data-testid='send-button'`.
 
 Give exactly ONE CSS selector — never a comma-separated list of alternatives.
 
@@ -840,6 +864,8 @@ def _detect_response_only(page: Any, url: str) -> Optional[str]:
     prompt = f"""You are a web automation expert. Below is the stripped HTML of a chatbot UI at {url}.
 
 Find the CSS selector for the element that holds the BOT's reply messages (the latest one). Use :last-child or :last-of-type if it's a list. Do not pick a generic dashboard card, sidebar, or navbar.
+
+For standard chatbots (ChatGPT, Claude, Perplexity, Copilot, Grok, etc.), the bot's response is typically inside a container class like `.markdown`, `.prose`, `.message[data-author='assistant']`, `.agent-turn`, or similar. You MUST target the text content of the BOT's message (not the user's message, and not the entire chat history container). If messages are in a list, target the last bot message specifically.
 
 CRITICAL: Do NOT select .chat-input, input, textarea, composer, or send button. The selector MUST target a chat message bubble or bot reply element.
 
@@ -996,9 +1022,9 @@ def _auto_detect_with_llm(screenshot_bytes: bytes, url: str) -> dict[str, str]:
     prompt = f"""You are a web automation expert. Below is a base64-encoded screenshot of a chatbot web UI at {url}.
 
 Identify the BEST CSS selector for each of these three elements:
-1. The text input / textarea where the user types their message
-2. The send / submit button
-3. The element that contains the bot's response (the latest message)
+1. The text input / textarea where the user types their message (often `textarea`, `.ProseMirror`, or `#prompt-textarea`).
+2. The send / submit button (often a `<button>` with an arrow/paper-plane icon or `aria-label='Send message'`).
+3. The element that contains the bot's response (for generic chatbots, often `.markdown`, `.prose`, `.message[data-author='assistant']`, or `.agent-turn`). Target the text content bubble specifically.
 
 Respond in EXACTLY this format (one selector per line, no explanation):
 INPUT_SELECTOR: <selector>
@@ -1242,12 +1268,14 @@ def auto_detect_selectors(
         response_sel = _validate_llm_selector(candidate, "response", page, _is_chat_response_selector)
     _check_budget("response detection")
     if not response_sel:
-        raise BrowserAutoDetectError(
-            f"Auto-detection found input ('{input_sel}') and send ('{send_sel}') "
-            f"but could not identify the bot-response container on '{url}'. "
-            f"SOLUTION: Open the chatbot in Chrome → right-click a bot reply → "
-            f"Inspect → copy the selector and provide it as response_selector."
+        print(
+            f"[browser debug] Could not identify response container on '{url}' — "
+            f"activating page-transcript fallback mode. "
+            f"The connector will type the task, press Enter, wait for the page to "
+            f"settle, then scrape the full visible text and slice out everything "
+            f"after the user's own question to recover the bot's reply."
         )
+        response_sel = _RESPONSE_SEL_FALLBACK
     detected["response"] = response_sel
 
     _SELECTOR_CACHE[key] = detected
@@ -1646,12 +1674,17 @@ def _ensure_visible_response_sel(sel: str) -> str:
     We strip any existing `>> nth=N` suffix so auto-detected selectors
     that already embed `:last-child` work without a conflicting nth pin.
     """
+    # Never mutate the page-transcript fallback sentinel — it must remain
+    # an exact string match for _RESPONSE_SEL_FALLBACK throughout the call.
+    if sel == _RESPONSE_SEL_FALLBACK:
+        return sel
     import re as _re
     # Remove any trailing >> nth=N the caller may have added
     sel = _re.sub(r"\s*>>\s*nth=\d+", "", sel).strip()
     if "visible=" not in sel.lower():
         return f"{sel} >> visible=true"
     return sel
+
 
 def _wait_for_selector_with_frames(
     page: Any,
@@ -1766,6 +1799,74 @@ def _clean_ui_metadata(text: str) -> str:
     return cleaned
 
 
+def _extract_response_from_page_transcript(
+    page: Any,
+    task: str,
+    wait_s: float = 20.0,
+    pre_send_baseline: str = "",
+) -> str:
+    """Page-transcript fallback: used when no response-container selector could be found.
+
+    Strategy:
+      1. Use `pre_send_baseline` (captured BEFORE the task was typed/sent) as the
+         reliable baseline. This is the entire conversation history up to this point.
+      2. Wait up to `wait_s` seconds for the page text to grow BEYOND that baseline
+         and then stop changing (bot has finished streaming).
+      3. Return everything after the baseline, cleaned of UI metadata.
+
+    This works for any chatbot where the conversation renders as visible page text,
+    regardless of how much existing history is already on the page.
+    """
+    def _full_page_text() -> str:
+        try:
+            return page.evaluate("() => document.body.innerText") or ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    baseline = pre_send_baseline or _full_page_text()
+    baseline_len = len(baseline)
+
+    # Poll until the page text grows beyond the baseline AND stabilises
+    deadline = time.perf_counter() + wait_s
+    stability_s = 1.5
+    last_text = baseline
+    last_change = time.perf_counter()
+
+    while time.perf_counter() < deadline:
+        page.wait_for_timeout(500)
+        current = _full_page_text()
+        if current != last_text:
+            last_text = current
+            last_change = time.perf_counter()
+        elif (
+            time.perf_counter() - last_change >= stability_s
+            and len(current) > baseline_len
+        ):
+            # Page grew beyond baseline AND has been stable — bot is done
+            break
+
+    final_text = last_text
+
+    # Primary strategy: slice everything after the pre-send baseline length
+    if len(final_text) > baseline_len:
+        response_raw = final_text[baseline_len:]
+    else:
+        # Fallback: try to find the task anchor and take everything after it
+        task_snippet = task.strip()[:80]
+        idx = final_text.find(task_snippet)
+        if idx != -1:
+            response_raw = final_text[idx + len(task_snippet):]
+        else:
+            response_raw = ""
+
+    response_raw = response_raw.strip()
+    response_raw = _clean_ui_metadata(response_raw)
+    print(
+        f"[browser debug] page-transcript fallback: extracted {len(response_raw)} chars "
+        f"(baseline={baseline_len}, final={len(final_text)})."
+    )
+    return response_raw
+
 def _read_last_response(page: Any, sel: str) -> tuple[int, str]:
     """(match_count, inner_text of the LAST match) for a response selector.
     Falls back to child frames when the main page has no match."""
@@ -1832,7 +1933,17 @@ def _wait_for_response_text(
     the user's own echoed message or a "Typing..." placeholder are ignored,
     and a candidate must stay unchanged for `stability_s` (a still-streaming
     reply keeps resetting the clock)."""
+    # Safety guard: this function must never be called with the page-transcript
+    # sentinel — that would make Playwright try to query "__page_transcript__"
+    # as a real CSS selector, which always fails. The caller (call_browser_aut)
+    # should have routed to _extract_response_from_page_transcript instead.
+    if response_sel == _RESPONSE_SEL_FALLBACK:
+        raise ValueError(
+            "_wait_for_response_text called with _RESPONSE_SEL_FALLBACK sentinel — "
+            "this is a bug; the caller should use _extract_response_from_page_transcript instead."
+        )
     deadline = time.perf_counter() + timeout_s
+
     last_seen: Optional[str] = None
     stable_since: Optional[float] = None
     while time.perf_counter() < deadline:
@@ -2143,13 +2254,17 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
             curr_p = urlparse(current_url)
             tgt_p = urlparse(config.chatbot_url)
             log_p = urlparse(config.login_url) if config.login_url else None
-            
-            # If the SPA natively routed us to a different path on the same host,
-            # trust its native routing over forcing a hard reload, BUT only if
-            # we actually left the login page.
-            if curr_p.netloc == tgt_p.netloc and log_p and curr_p.path != log_p.path:
-                tgt_path = tgt_p.path.rstrip("/")
-                if tgt_path == "" or curr_p.path.startswith(tgt_path):
+
+            # If we're already on the same host as the target chatbot, trust the
+            # SPA's own routing and DO NOT force a hard reload. This covers:
+            #  - Chatbots that create a new conversation URL (e.g. ChatGPT goes from
+            #    chatgpt.com → chatgpt.com/c/<id>) — we must stay on that thread.
+            #  - SPAs that routed us to a sub-path after login.
+            # Only navigate away if we're on the login page (to avoid getting stuck
+            # there if auth failed silently).
+            if curr_p.netloc == tgt_p.netloc:
+                on_login_page = log_p and curr_p.path == log_p.path
+                if not on_login_page:
                     needs_navigation = False
 
         if needs_navigation:
@@ -2228,13 +2343,24 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
         # Snapshot the response area BEFORE sending: how many matches exist, the
         # last one's text, and (new_element) which DOM node it is. "New reply" is
         # judged against this in _wait_for_response_text(). No-wait, frame-aware.
+        # Skip when using the page-transcript fallback — there is no real selector.
         before_count, before_text = 0, ""
-        try:
-            before_count, _snap_text = _read_last_response(page, response_sel)
-            before_text = _snap_text.strip()
-            _mark_last_response_node(page, response_sel)
-        except Exception:  # noqa: BLE001
-            pass
+        if response_sel != _RESPONSE_SEL_FALLBACK:
+            try:
+                before_count, _snap_text = _read_last_response(page, response_sel)
+                before_text = _snap_text.strip()
+                _mark_last_response_node(page, response_sel)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # For the page-transcript fallback, capture a full-page-text baseline
+        # BEFORE typing so we can reliably slice off only the new bot reply.
+        page_transcript_baseline: str = ""
+        if response_sel == _RESPONSE_SEL_FALLBACK:
+            try:
+                page_transcript_baseline = page.evaluate("() => document.body.innerText") or ""
+            except Exception:  # noqa: BLE001
+                page_transcript_baseline = ""
 
         # Click input and type the task.
         try:
@@ -2345,7 +2471,18 @@ def call_browser_aut(task: str, config: "BrowserConfig", on_event: Optional[Any]
         # ---- Wait for response -------------------------------------------
         response_text = ""
 
-        if config.wait_strategy in ("new_element", "text_change"):
+        if response_sel == _RESPONSE_SEL_FALLBACK:
+            # Page-transcript fallback: no response container was detected.
+            # Read the entire visible page text, wait for it to grow and
+            # stabilise, then slice out everything after the user's question.
+            print("[browser debug] Using page-transcript fallback to extract bot response.")
+            response_text = _extract_response_from_page_transcript(
+                page, task,
+                wait_s=config.wait_timeout_seconds,
+                pre_send_baseline=page_transcript_baseline,
+            )
+
+        elif config.wait_strategy in ("new_element", "text_change"):
             # Both strategies share one detector (see _wait_for_response_text):
             #   new_element -- a strictly NEW node (or one more match) must appear;
             #   text_change -- additionally accepts the last node's text changing.
