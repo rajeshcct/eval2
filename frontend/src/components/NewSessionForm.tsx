@@ -82,6 +82,8 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
   const [showSocketioAdvanced, setShowSocketioAdvanced] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [reloadSessionId, setReloadSessionId] = useState("");
+  const [userDescription, setUserDescription] = useState<string>("");
+  const [showUserDescription, setShowUserDescription] = useState(false);
 
   // Evaluation control
   const ALL_CATEGORIES = ["functionality", "security", "compliance"] as const;
@@ -237,6 +239,7 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
       start_difficulty: startDifficulty !== 1 ? startDifficulty : null,
       max_difficulty: maxDifficulty !== 5 ? maxDifficulty : null,
       pass_threshold: passThreshold !== 6 ? passThreshold : null,
+      user_capability_description: userDescription.trim() ? userDescription.trim() : null,
     };
     onStart(request);
   }
@@ -254,6 +257,54 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
           <p className="mt-1 text-sm text-slate-400">
             Point EvalMind at an Agent Under Test and start a live evaluation.
           </p>
+        </div>
+
+        {/* Optional chatbot description */}
+        <div className="rounded-md border border-slate-800 bg-slate-900/30 p-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="text-lg">💬</span>
+              <span className="text-sm font-medium text-slate-200">Describe your chatbot</span>
+              <span className="rounded-full bg-slate-700/60 px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-400">Optional</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowUserDescription((v) => !v)}
+              className={`rounded-md border px-3 py-1.5 text-xs font-medium transition-colors ${
+                showUserDescription
+                  ? "border-cyan-500 bg-cyan-600/20 text-cyan-200"
+                  : "border-slate-700 bg-slate-800 text-slate-300 hover:bg-slate-700"
+              }`}
+            >
+              {showUserDescription ? "Hide" : "Enable"}
+            </button>
+          </div>
+          {!showUserDescription && (
+            <p className="mt-2 text-xs text-slate-500">
+              Tell EvalMind what your chatbot does. It will also ask the chatbot itself
+              and compare both answers — generating smarter evaluation questions.
+            </p>
+          )}
+          {showUserDescription && (
+            <div className="mt-3 flex flex-col gap-2">
+              <textarea
+                id="user_capability_description"
+                rows={4}
+                placeholder="e.g. This is a customer support chatbot for an e-commerce platform. It can help with order tracking, returns, product recommendations, and FAQ. It should not reveal internal pricing strategies or customer data."
+                value={userDescription}
+                onChange={(e) => setUserDescription(e.target.value)}
+                className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500"
+              />
+              <div className="rounded-md border border-cyan-900/40 bg-cyan-950/20 px-3 py-2">
+                <p className="text-xs text-cyan-400">
+                  <strong>How it works:</strong> EvalMind will ask your chatbot “What can you do?”
+                  and compare its answer with your description. If they differ significantly,
+                  you’ll see a warning before evaluation starts. Both descriptions are combined
+                  to generate more targeted test questions.
+                </p>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="flex flex-col gap-2">

@@ -17,6 +17,9 @@ file) is unaffected.
 Event types and their `data` payload:
     describer_started    -- {}
     describer_completed  -- DescriberResult.model_dump()
+    description_comparison_started -- {"user_description": str}
+    description_comparison_completed -- DescriptionComparisonResult.model_dump()
+    capability_mismatch  -- DescriptionComparisonResult.model_dump()
     category_started     -- {"category": str}
     round_started         -- {"category": str, "round_number": int, "difficulty": int}
     round_completed       -- RoundResult.model_dump()
@@ -37,6 +40,9 @@ OnEvent = Callable[[ProgressEvent], None]
 EVENT_TYPES = (
     "describer_started",
     "describer_completed",
+    "description_comparison_started",
+    "description_comparison_completed",
+    "capability_mismatch",
     "category_started",
     "round_started",
     "round_completed",

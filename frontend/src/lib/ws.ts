@@ -23,6 +23,16 @@ export interface DescriberResult {
   mismatch_notes: string | null;
 }
 
+/** Mirrors agents/schemas.py::DescriptionComparisonResult. */
+export interface DescriptionComparisonResult {
+  similarity_score: number;
+  descriptions_match: boolean;
+  combined_description: string;
+  user_description_summary: string;
+  aut_self_report_summary: string;
+  mismatch_notes: string | null;
+}
+
 /** Mirrors pipeline.py::RoundResult. */
 export interface RoundResult {
   session_id: string;
@@ -132,6 +142,9 @@ export interface FinalReport {
 export type ProgressEvent =
   | { type: "describer_started"; data: Record<string, never> }
   | { type: "describer_completed"; data: DescriberResult }
+  | { type: "description_comparison_started"; data: { user_description: string } }
+  | { type: "description_comparison_completed"; data: DescriptionComparisonResult }
+  | { type: "capability_mismatch"; data: DescriptionComparisonResult }
   | { type: "category_started"; data: { category: string } }
   | { type: "round_started"; data: { category: string; round_number: number; difficulty: number } }
   | { type: "round_completed"; data: RoundResult }
@@ -142,6 +155,9 @@ export type ProgressEvent =
 export const PROGRESS_EVENT_TYPES = [
   "describer_started",
   "describer_completed",
+  "description_comparison_started",
+  "description_comparison_completed",
+  "capability_mismatch",
   "category_started",
   "round_started",
   "round_completed",
@@ -210,6 +226,14 @@ export function startRun(request: SessionStartRequest, handlers: RunWebSocketHan
   }
 
   return socket;
+}
+
+/** Send a JSON message through an existing WebSocket (used for mismatch
+ * confirmation responses). Safe to call even if the socket is closing. */
+export function sendWsMessage(socket: WebSocket, message: Record<string, unknown>): void {
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(message));
+  }
 }
 
 /** GET /api/sessions/{session_id}/report — used by Phase V's reload path;

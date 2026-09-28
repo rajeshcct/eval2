@@ -261,4 +261,8 @@ export interface SessionStartRequest {
   max_difficulty?: number | null;
   /** Pass/fail threshold for primary metrics (1–10, default 6). */
   pass_threshold?: number | null;
+  /** Optional user-provided description of what the chatbot does. When set,
+   * EvalMind also asks the chatbot itself and compares both descriptions
+   * before generating evaluation questions. */
+  user_capability_description?: string | null;
 }

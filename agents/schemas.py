@@ -126,3 +126,53 @@ class DescriberResult(BaseModel):
             "a claimed capability that wasn't demonstrated). None if no mismatch was found."
         ),
     )
+
+
+class DescriptionComparisonResult(BaseModel):
+    """Result of comparing the user-provided chatbot description with the AUT's
+    own self-report. Used by the optional chatbox feature where the user describes
+    what their chatbot does, and EvalMind also asks the chatbot itself.
+
+    If similarity_score < 5 (out of 10), the descriptions are considered mismatched
+    and the user is warned before proceeding. The combined_description merges both
+    signals regardless — favoring what the AUT actually reported where they conflict.
+    """
+
+    similarity_score: int = Field(
+        ..., ge=0, le=10,
+        description=(
+            "How similar are the user's description and the AUT's self-report? "
+            "10 = essentially identical, 0 = completely different topics/scope."
+        ),
+    )
+    descriptions_match: bool = Field(
+        ...,
+        description=(
+            "True if the two descriptions are broadly consistent (similarity >= 5). "
+            "False if they diverge enough to warrant a mismatch warning."
+        ),
+    )
+    combined_description: str = Field(
+        ..., min_length=1,
+        description=(
+            "A merged capability description that incorporates BOTH the user's "
+            "description and the AUT's own self-report — favoring the AUT's actual "
+            "response where they conflict. Written as a plain-English spec suitable "
+            "for the Generator agent."
+        ),
+    )
+    user_description_summary: str = Field(
+        ..., min_length=1,
+        description="Concise summary of what the USER said the chatbot does.",
+    )
+    aut_self_report_summary: str = Field(
+        ..., min_length=1,
+        description="Concise summary of what the AUT said about itself.",
+    )
+    mismatch_notes: Optional[str] = Field(
+        None,
+        description=(
+            "If the descriptions diverge, a concrete explanation of the differences. "
+            "None if they are broadly consistent."
+        ),
+    )

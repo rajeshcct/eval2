@@ -2,8 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import NewSessionForm from "./components/NewSessionForm";
 import LiveRunView from "./components/LiveRunView";
 import ReportView from "./components/ReportView";
-import { fetchSessionReport, startRun } from "./lib/ws";
-import type { FinalReport, ProgressEvent } from "./lib/ws";
+import { fetchSessionReport, startRun, sendWsMessage } from "./lib/ws";
+import type { FinalReport, ProgressEvent, DescriptionComparisonResult } from "./lib/ws";
 import type { SessionStartRequest } from "./lib/types";
 
 /**
@@ -62,6 +62,9 @@ export default function App() {
   // Distinct from socketError (which covers a connection that never opened
   // at all) so the UI can offer a specific, actionable "Retry" affordance.
   const [disconnected, setDisconnected] = useState(false);
+  // Mismatch state: when the user's description and the chatbot's own answer
+  // diverge, the backend pauses and waits for the user to confirm or abort.
+  const [mismatchData, setMismatchData] = useState<DescriptionComparisonResult | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   // Bookkeeping refs read inside WS event-handler closures (so they must
   // always reflect the latest value, hence refs rather than state) to
@@ -131,6 +134,11 @@ export default function App() {
 
     setEvents((prev) => [...prev, event]);
 
+    if (event.type === "capability_mismatch") {
+      // The backend is paused, waiting for the user to confirm or abort.
+      setMismatchData(event.data as DescriptionComparisonResult);
+    }
+
     if (event.type === "session_completed") {
       // The just-finished run's FinalReport arrives here already, in
       // full — no extra fetch needed to show it (Phase IV requirement 5).
@@ -158,6 +166,7 @@ export default function App() {
     hasOpenedRef.current = false;
     intentionalCloseRef.current = false;
     terminalEventReceivedRef.current = false;
+    setMismatchData(null);
 
     const socket = startRun(request, {
       onEvent: handleEvent,
@@ -210,6 +219,7 @@ export default function App() {
     setFinalReport(null);
     setSocketError(null);
     setDisconnected(false);
+    setMismatchData(null);
     setReportStatus("loaded");
     setReportError(null);
     setPendingSessionId(null);
@@ -239,6 +249,13 @@ export default function App() {
           disconnected={disconnected}
           onRetry={handleRetry}
           onCancel={handleReset}
+          mismatchData={mismatchData}
+          onMismatchResponse={(action: "continue" | "abort") => {
+            if (socketRef.current) {
+              sendWsMessage(socketRef.current, { action });
+            }
+            setMismatchData(null);
+          }}
         />
       )}
 

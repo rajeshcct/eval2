@@ -346,3 +346,182 @@ def describe_aut(aut_config: AUTConfig, on_event: Optional[OnEvent] = None) -> D
         f"Describer failed to produce valid structured output after {MAX_RETRIES + 1} attempt(s). "
         f"Last error: {last_error}"
     ) from last_error
+
+
+# ==========================================================================
+# User vs AUT description comparison — compares a user-provided chatbot
+# description with the AUT's own self-report and produces a combined
+# description + mismatch notes.
+# ==========================================================================
+def _build_comparison_task(
+    agent: Agent,
+    user_description: str,
+    aut_self_report: str,
+) -> Task:
+    from agents.schemas import DescriptionComparisonResult
+
+    description = f"""
+You are comparing two descriptions of the same chatbot/AI agent to decide
+whether they are broadly consistent, and to produce one combined description.
+
+DESCRIPTION 1 — FROM THE USER (the person who owns/built this chatbot):
+---
+{user_description}
+---
+
+DESCRIPTION 2 — FROM THE CHATBOT ITSELF (asked directly "Describe your role,
+what kinds of requests you handle, any tools or scope you have, and anything
+you're explicitly not able to do"):
+---
+{aut_self_report}
+---
+
+Your job:
+1. Write user_description_summary: a concise summary of what the USER said.
+2. Write aut_self_report_summary: a concise summary of what the AUT said.
+3. Assign a similarity_score (0-10):
+   - 10 = essentially identical scope and capabilities
+   - 7-9 = broadly the same with minor extra/missing details
+   - 4-6 = some overlap but notable differences in scope or capabilities
+   - 1-3 = significantly different — different domains, conflicting claims
+   - 0 = completely unrelated
+4. Set descriptions_match = true if similarity_score >= 5, else false.
+5. If descriptions_match is false, write mismatch_notes explaining EXACTLY
+   what diverges (concrete differences, not vague). If true, set to null.
+6. Write combined_description: merge BOTH signals into one capability
+   description suitable for generating test questions. Favor the AUT's own
+   self-report where they conflict (the AUT knows what it actually does),
+   but include useful context from the user's description that the AUT
+   didn't mention. If there's a mismatch, note it so the evaluator is aware.
+
+Your final output must be ONLY the structured schema — no extra prose.
+""".strip()
+
+    return Task(
+        description=description,
+        expected_output=(
+            "A DescriptionComparisonResult with similarity_score, descriptions_match, "
+            "combined_description, user_description_summary, aut_self_report_summary, "
+            "and mismatch_notes (null if no mismatch). Nothing else."
+        ),
+        agent=agent,
+        output_pydantic=DescriptionComparisonResult,
+    )
+
+
+def _extract_comparison_result(crew_output, task: Task):
+    from agents.schemas import DescriptionComparisonResult
+
+    result = getattr(crew_output, "pydantic", None)
+    if isinstance(result, DescriptionComparisonResult):
+        return result
+
+    task_output = getattr(task, "output", None)
+    result = getattr(task_output, "pydantic", None)
+    if isinstance(result, DescriptionComparisonResult):
+        return result
+
+    return None
+
+
+def compare_descriptions(
+    user_description: str,
+    aut_config: AUTConfig,
+    on_event: Optional[OnEvent] = None,
+):
+    """
+    Compare a user-provided chatbot description with the AUT's own self-report.
+
+    1. Asks the AUT "what do you do?" (same self-report pass as describe_aut)
+    2. Runs an LLM comparison of the user's description vs the AUT's answer
+    3. Returns a DescriptionComparisonResult with similarity score, combined
+       description, and mismatch notes
+
+    Args:
+        user_description: what the user says their chatbot does.
+        aut_config: connection config for calling the AUT.
+        on_event: optional progress callback.
+
+    Returns:
+        A DescriptionComparisonResult.
+
+    Raises:
+        DescriberError: if the self-report pass fails or the LLM comparison
+                        fails after retries.
+    """
+    from agents.schemas import DescriptionComparisonResult
+
+    emit_event(on_event, "description_comparison_started", {
+        "user_description": user_description,
+    })
+
+    # Step 1: Ask the AUT what it does (reuse existing self-report pass)
+    try:
+        aut_self_report = _run_self_report_pass(aut_config, on_event=on_event)
+    except DescriberError as e:
+        emit_event(on_event, "error", {"stage": "description_comparison", "message": str(e)})
+        raise
+
+    # Step 2: LLM comparison
+    agent = build_describer_agent()
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, MAX_RETRIES + 2):
+        try:
+            comparison_task = _build_comparison_task(agent, user_description, aut_self_report)
+            crew = Crew(
+                agents=[agent], tasks=[comparison_task],
+                process=Process.sequential, verbose=False,
+            )
+
+            import asyncio
+            try:
+                asyncio.get_running_loop()
+                in_loop = True
+            except RuntimeError:
+                in_loop = False
+
+            if in_loop:
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    crew_output = executor.submit(crew.kickoff).result()
+            else:
+                crew_output = crew.kickoff()
+
+            result = _extract_comparison_result(crew_output, comparison_task)
+            if result is None:
+                raise DescriberError(
+                    f"Description comparison did not return a valid result "
+                    f"(attempt {attempt}/{MAX_RETRIES + 1})."
+                )
+            if not result.combined_description or not result.combined_description.strip():
+                raise DescriberError(
+                    f"Description comparison returned an empty combined_description "
+                    f"(attempt {attempt}/{MAX_RETRIES + 1})."
+                )
+
+            # Emit the appropriate event based on whether descriptions match
+            if result.descriptions_match:
+                emit_event(on_event, "description_comparison_completed", result.model_dump())
+            else:
+                emit_event(on_event, "capability_mismatch", result.model_dump())
+
+            return result
+
+        except DescriberError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+            if attempt <= MAX_RETRIES:
+                err_str = str(e).lower()
+                wait = RETRY_DELAY_SECONDS * 2 if "rate_limit" in err_str or "ratelimit" in err_str else RETRY_DELAY_SECONDS
+                print(f"  [description_comparison retry {attempt}/{MAX_RETRIES}] waiting {wait}s before retry...")
+                time.sleep(wait)
+            continue
+
+    emit_event(on_event, "error", {"stage": "description_comparison", "message": str(last_error)})
+    raise DescriberError(
+        f"Description comparison failed after {MAX_RETRIES + 1} attempt(s). "
+        f"Last error: {last_error}"
+    ) from last_error
+

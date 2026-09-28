@@ -120,6 +120,7 @@ class SessionStartRequest(BaseModel):
     start_difficulty: Optional[int] = None
     max_difficulty: Optional[int] = None
     pass_threshold: Optional[int] = None
+    user_capability_description: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -144,6 +145,11 @@ class SessionStartRequest(BaseModel):
 # WS /ws/run — the live-run endpoint.
 # ==========================================================================
 _DONE = object()  # internal sentinel; never actually sent over the wire
+
+class _UserAbortedError(Exception):
+    """Raised when the user aborts an evaluation (e.g. after seeing a
+    capability mismatch warning). Internal to ws_run; never propagated."""
+    pass
 
 
 def _warm_up_socketio_aut(aut_config: Any) -> None:
@@ -191,6 +197,15 @@ async def ws_run(websocket: WebSocket) -> None:
 
     loop = asyncio.get_running_loop()
     queue: "asyncio.Queue[Any]" = asyncio.Queue()
+    # Used by the mismatch confirmation flow: when a capability_mismatch
+    # event fires, the worker thread blocks on this event until the WS
+    # reader puts the user's decision ("continue" or "abort") into
+    # mismatch_response_queue.
+    mismatch_response_queue: "asyncio.Queue[str]" = asyncio.Queue()
+    # Flag to tell the WS reader loop that we're currently waiting for a
+    # mismatch confirmation (so incoming messages should be routed there
+    # instead of being silently dropped).
+    awaiting_mismatch_response = False
 
     def on_event(event: Dict[str, Any]) -> None:
         # Called from the WORKER THREAD for every real progress event fired
@@ -200,6 +215,49 @@ async def ws_run(websocket: WebSocket) -> None:
         # call_soon_threadsafe is required for the former and harmless (if
         # marginally redundant) for the latter, so one helper covers both.
         loop.call_soon_threadsafe(queue.put_nowait, event)
+
+    # Wrapper on_event that intercepts capability_mismatch events to wait
+    # for user confirmation before proceeding with the session.
+    mismatch_barrier: "asyncio.Event" = asyncio.Event()
+    mismatch_decision: Dict[str, Any] = {"action": "continue"}
+
+    def on_event_with_mismatch_check(event: Dict[str, Any]) -> None:
+        nonlocal awaiting_mismatch_response
+        event_type = event.get("type", "")
+
+        if event_type == "capability_mismatch":
+            # Send the mismatch event to the client
+            on_event(event)
+            awaiting_mismatch_response = True
+            # Block the worker thread until the user responds
+            import threading
+            response_received = threading.Event()
+            response_holder: Dict[str, str] = {}
+
+            def _wait_for_response():
+                """Poll mismatch_response_queue from the event loop thread."""
+                try:
+                    resp = asyncio.run_coroutine_threadsafe(
+                        mismatch_response_queue.get(), loop
+                    ).result(timeout=300)  # 5 minute timeout
+                    response_holder["action"] = resp
+                except Exception:
+                    response_holder["action"] = "continue"  # default: continue on timeout
+                finally:
+                    awaiting_mismatch_response = False
+                    response_received.set()
+
+            import threading as _threading
+            t = _threading.Thread(target=_wait_for_response, daemon=True)
+            t.start()
+            response_received.wait(timeout=300)
+
+            action = response_holder.get("action", "continue")
+            if action == "abort":
+                on_event({"type": "error", "data": {"stage": "user_aborted", "message": "User aborted evaluation due to description mismatch."}})
+                raise _UserAbortedError("User aborted evaluation due to description mismatch.")
+        else:
+            on_event(event)
 
     async def worker() -> None:
         try:
@@ -271,17 +329,27 @@ async def ws_run(websocket: WebSocket) -> None:
             # network/LLM calls — MUST run off the event loop, or the
             # WebSocket (and every other connection this server is
             # handling) stops servicing messages for the whole run.
+            # Choose the right on_event wrapper: if the user provided a
+            # description, we need the mismatch interception layer.
+            effective_on_event = (
+                on_event_with_mismatch_check
+                if start_request.user_capability_description
+                else on_event
+            )
             await asyncio.to_thread(
                 run_full_session,
                 aut_config=aut_config,
                 max_rounds=start_request.max_rounds,
                 capability_description_override=start_request.capability_description_override,
-                on_event=on_event,
+                on_event=effective_on_event,
                 categories=start_request.categories or None,
                 start_difficulty=start_request.start_difficulty or 1,
                 max_difficulty=start_request.max_difficulty or 5,
                 pass_threshold=start_request.pass_threshold or None,
+                user_capability_description=start_request.user_capability_description,
             )
+        except _UserAbortedError:
+            pass  # Already sent the error event; just clean up
         except Exception as e:  # noqa: BLE001 - never let a real failure crash the socket silently
             on_event({"type": "error", "data": {"stage": "session", "message": str(e)}})
         finally:
@@ -308,6 +376,18 @@ async def ws_run(websocket: WebSocket) -> None:
             if item is _DONE:
                 break
             await websocket.send_json(item)
+
+            # If we just sent a capability_mismatch, read the user's
+            # response from the WS and put it into mismatch_response_queue.
+            if isinstance(item, dict) and item.get("type") == "capability_mismatch" and awaiting_mismatch_response:
+                try:
+                    raw_response = await asyncio.wait_for(
+                        websocket.receive_json(), timeout=300.0
+                    )
+                    action = raw_response.get("action", "continue")
+                    await mismatch_response_queue.put(action)
+                except (asyncio.TimeoutError, WebSocketDisconnect):
+                    await mismatch_response_queue.put("continue")
     except WebSocketDisconnect:
         # Client went away mid-run. run_full_session() is already executing
         # on its own background thread, mid real network/LLM calls — it

@@ -44,8 +44,8 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel
 
 from aggregator import FinalReport, build_final_report
-from agents.describer import describe_aut
-from agents.schemas import DescriberResult
+from agents.describer import compare_descriptions, describe_aut
+from agents.schemas import DescriptionComparisonResult, DescriberResult
 from aut.connector import AUTConfig
 from db.store import get_rounds_for_session, init_db, insert_session, update_session_description
 from loop_runner import CategoryLoopResult, run_category_loop
@@ -87,11 +87,16 @@ class SessionResult(BaseModel):
     itself) when the Describer actually ran - None when
     capability_description_override was used instead, since there is no
     discovery output to report in that case.
+
+    comparison_result is the result of comparing the user-provided chatbot
+    description with the AUT's own self-report — None when the user didn't
+    provide a description (the optional chatbox feature).
     """
 
     session_id: str
     capability_description: str
     describer_result: Optional[DescriberResult] = None
+    comparison_result: Optional[DescriptionComparisonResult] = None
     summaries: Dict[str, CategoryLoopResult]
     final_report: FinalReport
     # Categories whose loop was cut short by an error (partial run). Empty for
@@ -109,6 +114,7 @@ def run_full_session(
     start_difficulty: int = 1,
     max_difficulty: int = 5,
     pass_threshold: Optional[int] = None,
+    user_capability_description: Optional[str] = None,
 ) -> SessionResult:
     """
     Run the full EvalMind evaluation: auto-discover the AUT's capability
@@ -180,12 +186,30 @@ def run_full_session(
     # compare for them — effectively free.
     try:
         describer_result: Optional[DescriberResult] = None
+        comparison_result: Optional[DescriptionComparisonResult] = None
         session_id = str(uuid.uuid4())
         if capability_description_override is not None:
             if not capability_description_override.strip():
                 raise ValueError("capability_description_override must be a non-empty string if provided")
             capability_description = capability_description_override
             insert_session(session_id, aut_description=capability_description)
+        elif user_capability_description and user_capability_description.strip():
+            # User provided a description via the optional chatbox — compare
+            # it with the AUT's own self-report before proceeding.
+            insert_session(session_id, aut_description=_DISCOVERY_PENDING_DESCRIPTION)
+            try:
+                comparison_result = compare_descriptions(
+                    user_description=user_capability_description.strip(),
+                    aut_config=aut_config,
+                    on_event=on_event,
+                )
+            except Exception as e:
+                _mark_session_failed(session_id, f"[description comparison failed] {e}")
+                raise
+            # Use the combined description from comparison as the capability description.
+            # This merges the user's knowledge with the AUT's self-report.
+            capability_description = comparison_result.combined_description
+            update_session_description(session_id, capability_description)
         else:
             # The session row is created BEFORE the Describer runs (with a
             # placeholder description) so a run that dies during discovery still
@@ -270,6 +294,7 @@ def run_full_session(
             session_id=session_id,
             capability_description=capability_description,
             describer_result=describer_result,
+            comparison_result=comparison_result,
             summaries=summaries,
             final_report=final_report,
             failed_categories=failed_categories,

@@ -121,5 +121,12 @@ function applyEvent(state: LiveRunState, event: ProgressEvent): void {
     case "error":
       state.errors.push(event.data);
       return;
+
+    // Description comparison events are handled directly by App.tsx/LiveRunView
+    // via dedicated state (mismatchData), not through the live state reducer.
+    case "description_comparison_started":
+    case "description_comparison_completed":
+    case "capability_mismatch":
+      return;
   }
 }
