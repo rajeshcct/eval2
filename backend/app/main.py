@@ -13,15 +13,17 @@ project root" matters):
     python -m uvicorn backend.app.main:app --reload --port 8000
 """
 import asyncio
+import uuid
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 from typing import Any, AsyncIterator, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
-from aggregator import FinalReport, build_final_report
+from aggregator import FinalReport, build_final_report, compute_session_extras
 from agents.judge import judge_round, compute_passed
 from aut.auth import (
     ConnectionRequest,
@@ -41,6 +43,11 @@ from db.store import (
     list_sessions,
     delete_session,
     update_round_scores,
+    create_project,
+    find_project_by_name,
+    get_project,
+    list_projects,
+    set_session_project,
 )
 from session import run_full_session
 
@@ -121,6 +128,14 @@ class SessionStartRequest(BaseModel):
     max_difficulty: Optional[int] = None
     pass_threshold: Optional[int] = None
     user_capability_description: Optional[str] = None
+    # Optional free-text "Agent / Chatbot Brief" typed on the New Session form.
+    # Stored with the session and used ONLY as context for the report (shown in
+    # the Agent Profile card and given to the overall-verdict prompt). It is
+    # deliberately separate from user_capability_description above, which drives
+    # the compare-with-the-agent's-self-report flow and changes the evaluation.
+    agent_brief: Optional[str] = Field(default=None, max_length=2000)
+    # Project (group) to file this session under. session_id is unaffected.
+    project_id: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -177,6 +192,91 @@ def _warm_up_socketio_aut(aut_config: Any) -> None:
         pass
 
 
+# Human-readable labels for the connection modes, used in the report's Agent
+# Profile card. Derived from the mode the user actually selected -- nothing here
+# is guessed about the agent itself.
+_MODE_LABELS = {
+    "http": "HTTP / REST",
+    "direct_http": "Direct HTTP",
+    "socketio": "Socket.IO (JWT)",
+    "swagger": "Swagger / OpenAPI",
+    "browser": "Browser (Playwright)",
+    "public_api": "Public API (LLM)",
+}
+_AGENT_TYPES = {
+    "http": "HTTP chat API",
+    "direct_http": "HTTP chat API",
+    "swagger": "HTTP chat API (OpenAPI spec)",
+    "socketio": "Streaming chat agent (Socket.IO)",
+    "browser": "Web chatbot (driven through its browser UI)",
+    "public_api": "LLM with a system prompt",
+}
+
+
+def _safe_endpoint(url: Optional[str]) -> Optional[str]:
+    """scheme://host[:port]/path only. Credentials embedded in the URL and any
+    query string (which can carry tokens) are dropped before it is stored."""
+    if not url or not url.strip():
+        return None
+    raw = url.strip()
+    try:
+        parsed = urlsplit(raw if "://" in raw else f"//{raw}")
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if not host:
+        return None
+    netloc = f"{host}:{port}" if port else host
+    scheme = f"{parsed.scheme}://" if parsed.scheme else ""
+    path = parsed.path if parsed.path not in ("", "/") else ""
+    return f"{scheme}{netloc}{path}"
+
+
+def _auth_label(conn: Any) -> str:
+    """How the AUT is authenticated, from the settings the user supplied. Only
+    the KIND of auth is recorded, never a credential."""
+    mode = conn.mode
+    if mode == "http":
+        return "Login (username / password)" if getattr(conn, "requires_login", False) else "None configured"
+    if mode == "browser":
+        return "Browser login (username / password)" if getattr(conn, "requires_login", False) else "None configured"
+    if mode == "socketio":
+        return "Bearer token (JWT)"
+    if mode == "swagger":
+        return "Bearer token" if getattr(conn, "bearer_token", None) else "None configured"
+    if mode == "public_api":
+        return "Provider API key (server-side)"
+    return "None configured"
+
+
+def _connection_meta(conn: Any) -> Dict[str, Any]:
+    """Secret-free description of how EvalMind reaches the AUT, stored on the
+    session (see session._build_session_meta) and shown in the report. Keys with
+    no real value are omitted so the UI never displays a made-up placeholder.
+
+    agent_name is a display label derived from the connection (the endpoint's
+    host, or the model string for a public_api AUT) -- the form has no separate
+    "agent name" field, so this is an identifier, not something the user chose.
+    """
+    mode = conn.mode
+    endpoint = _safe_endpoint(getattr(conn, "chat_endpoint_url", None) or getattr(conn, "chatbot_url", None))
+    if mode == "public_api":
+        agent_name = (getattr(conn, "model", "") or "").strip() or None
+    elif endpoint:
+        agent_name = urlsplit(endpoint if "://" in endpoint else f"//{endpoint}").hostname
+    else:
+        agent_name = None
+    meta: Dict[str, Any] = {
+        "agent_name": agent_name,
+        "agent_type": _AGENT_TYPES.get(mode),
+        "connection_mode": _MODE_LABELS.get(mode, mode),
+        "endpoint": endpoint,
+        "auth": _auth_label(conn),
+    }
+    return {k: v for k, v in meta.items() if v}
+
+
 @app.websocket("/ws/run")
 async def ws_run(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -194,6 +294,19 @@ async def ws_run(websocket: WebSocket) -> None:
     except Exception as e:  # noqa: BLE001 - pydantic ValidationError: wrong shape
         await _send_error_and_close(websocket, "request_validation", str(e))
         return
+
+    # A project picked on the form could have been removed since the list was
+    # fetched -- fail up front with a clear message instead of a foreign-key
+    # error after the (slow) auto-discovery has already started.
+    if start_request.project_id:
+        chosen_project = await asyncio.to_thread(get_project, start_request.project_id)
+        if chosen_project is None:
+            await _send_error_and_close(
+                websocket,
+                "project",
+                f"Project {start_request.project_id!r} no longer exists. Pick another project or skip it.",
+            )
+            return
 
     loop = asyncio.get_running_loop()
     queue: "asyncio.Queue[Any]" = asyncio.Queue()
@@ -347,6 +460,9 @@ async def ws_run(websocket: WebSocket) -> None:
                 max_difficulty=start_request.max_difficulty or 5,
                 pass_threshold=start_request.pass_threshold or None,
                 user_capability_description=start_request.user_capability_description,
+                agent_brief=start_request.agent_brief,
+                project_id=start_request.project_id,
+                connection_meta=_connection_meta(start_request.connection),
             )
         except _UserAbortedError:
             pass  # Already sent the error event; just clean up
@@ -430,7 +546,13 @@ async def get_session_report(session_id: str) -> FinalReport:
     row = await asyncio.to_thread(get_final_report, session_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"No final report found for session_id={session_id!r}")
-    return FinalReport.model_validate_json(row["report_json"])
+    report = FinalReport.model_validate_json(row["report_json"])
+    # Refresh the session-context fields (brief, project, duration, run settings)
+    # from the DB on every read: the stored JSON predates them for older sessions,
+    # and a project assignment can change after the report was generated. No LLM
+    # call -- it is just a couple of SELECTs.
+    extras = await asyncio.to_thread(compute_session_extras, session_id)
+    return report.model_copy(update=extras)
 
 
 # ==========================================================================
@@ -450,6 +572,78 @@ class SessionSummary(BaseModel):
     aut_description: str
     started_at: str
     has_report: bool
+    project_id: Optional[str] = None
+    project_name: Optional[str] = None
+    # Display name recorded at session start (see _connection_meta); None for
+    # sessions recorded before it existed.
+    agent_name: Optional[str] = None
+
+
+# ==========================================================================
+# Projects -- an organizational layer above sessions.
+#   Project -> Sessions -> Rounds
+# A session keeps its own unique session_id and stays reachable by it
+# (GET /api/sessions/{session_id}/report is untouched); a project is just an
+# optional grouping pointer stored on the session.
+# ==========================================================================
+class ProjectSummary(BaseModel):
+    id: str
+    name: str
+    description: Optional[str] = None
+    created_at: str
+    session_count: int = 0
+
+
+class CreateProjectRequest(BaseModel):
+    name: str = Field(max_length=120)
+    description: Optional[str] = Field(default=None, max_length=500)
+
+
+class AssignProjectRequest(BaseModel):
+    # None moves the session out of its project.
+    project_id: Optional[str] = None
+
+
+@app.get("/api/projects", response_model=list[ProjectSummary])
+async def get_projects(_: None = Depends(_check_api_key)) -> list[ProjectSummary]:
+    """All projects with their session counts, alphabetical."""
+    rows = await asyncio.to_thread(list_projects)
+    return [ProjectSummary(**r) for r in rows]
+
+
+@app.post("/api/projects", response_model=ProjectSummary, status_code=201)
+async def post_project(
+    body: CreateProjectRequest,
+    _: None = Depends(_check_api_key),
+) -> ProjectSummary:
+    """Create a project. Names are unique (case-insensitive) so two projects
+    can't be confused in the picker."""
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="Project name is required.")
+    existing = await asyncio.to_thread(find_project_by_name, name)
+    if existing is not None:
+        raise HTTPException(status_code=409, detail=f"A project named {existing['name']!r} already exists.")
+    description = (body.description or "").strip() or None
+    row = await asyncio.to_thread(create_project, str(uuid.uuid4()), name, description)
+    return ProjectSummary(**row)
+
+
+@app.put("/api/sessions/{session_id}/project")
+async def put_session_project(
+    session_id: str,
+    body: AssignProjectRequest,
+    _: None = Depends(_check_api_key),
+) -> Dict[str, Any]:
+    """File an existing session under a project (or pass null to unfile it)."""
+    if body.project_id is not None:
+        project = await asyncio.to_thread(get_project, body.project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f"No project found with id={body.project_id!r}")
+    updated = await asyncio.to_thread(set_session_project, session_id, body.project_id)
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"No session found with id={session_id!r}")
+    return {"session_id": session_id, "project_id": body.project_id}
 
 
 @app.get("/api/sessions", response_model=list[SessionSummary])

@@ -30,6 +30,7 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
         conn.executescript(SCHEMA_PATH.read_text())
         conn.commit()
         _migrate_add_reasoning_column(conn)
+        _migrate_add_session_columns(conn)
     finally:
         conn.close()
 
@@ -47,17 +48,56 @@ def _migrate_add_reasoning_column(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+def _migrate_add_session_columns(conn: sqlite3.Connection) -> None:
+    """One-off migration for DBs created before `sessions` had agent_brief,
+    project_id and session_meta. Same idea as _migrate_add_reasoning_column:
+    PRAGMA table_info first, ALTER only what is missing, so it is a no-op on
+    an up-to-date DB. The project_id index is created here (not in
+    schema.sql) because on an old DB the column does not exist yet when
+    schema.sql runs.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+    if "agent_brief" not in existing:
+        conn.execute("ALTER TABLE sessions ADD COLUMN agent_brief TEXT")
+    if "project_id" not in existing:
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL"
+        )
+    if "session_meta" not in existing:
+        conn.execute("ALTER TABLE sessions ADD COLUMN session_meta TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions (project_id)")
+    conn.commit()
+
+
 def insert_session(
     id: str,
     aut_description: str,
     db_path: Path = DEFAULT_DB_PATH,
+    agent_brief: Optional[str] = None,
+    project_id: Optional[str] = None,
+    session_meta: Optional[dict[str, Any]] = None,
 ) -> None:
-    """Insert a new evaluation session. started_at is set by the DB default."""
+    """Insert a new evaluation session. started_at is set by the DB default.
+
+    The extra fields are keyword-friendly and come AFTER db_path on purpose, so
+    every pre-existing positional caller keeps working unchanged.
+    - agent_brief: the optional free-text brief the user typed about the agent.
+    - project_id: the project this session is grouped under (must exist).
+    - session_meta: JSON-serializable snapshot of the connection/run settings
+      (never credentials) -- stored as JSON text.
+    """
     conn = _connect(db_path)
     try:
         conn.execute(
-            "INSERT INTO sessions (id, aut_description) VALUES (?, ?)",
-            (id, aut_description),
+            "INSERT INTO sessions (id, aut_description, agent_brief, project_id, session_meta) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                id,
+                aut_description,
+                agent_brief,
+                project_id,
+                json.dumps(session_meta) if session_meta else None,
+            ),
         )
         conn.commit()
     finally:
@@ -228,10 +268,12 @@ def list_sessions(limit: int = 50, db_path: Path = DEFAULT_DB_PATH) -> list[dict
     try:
         rows = conn.execute(
             """
-            SELECT s.id, s.aut_description, s.started_at,
+            SELECT s.id, s.aut_description, s.started_at, s.project_id, s.session_meta,
+                   p.name AS project_name,
                    CASE WHEN fr.session_id IS NOT NULL THEN 1 ELSE 0 END AS has_report
             FROM sessions s
             LEFT JOIN final_reports fr ON fr.session_id = s.id
+            LEFT JOIN projects p ON p.id = s.project_id
             ORDER BY s.started_at DESC
             LIMIT ?
             """,
@@ -239,7 +281,21 @@ def list_sessions(limit: int = 50, db_path: Path = DEFAULT_DB_PATH) -> list[dict
         ).fetchall()
     finally:
         conn.close()
-    return [dict(r) for r in rows]
+    results: list[dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        # session_meta is a JSON blob; only the agent's display name is surfaced
+        # on the lightweight history rows.
+        meta_raw = d.pop("session_meta", None)
+        agent_name = None
+        if meta_raw:
+            try:
+                agent_name = (json.loads(meta_raw) or {}).get("agent_name")
+            except (TypeError, ValueError):
+                agent_name = None
+        d["agent_name"] = agent_name
+        results.append(d)
+    return results
 
 
 def delete_session(session_id: str, db_path: Path = DEFAULT_DB_PATH) -> bool:
@@ -249,6 +305,104 @@ def delete_session(session_id: str, db_path: Path = DEFAULT_DB_PATH) -> bool:
     conn = _connect(db_path)
     try:
         cursor = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ==========================================================================
+# Projects -- an organizational layer above sessions. A session keeps its own
+# unique id; project_id is just an optional grouping pointer on the session row.
+# ==========================================================================
+def create_project(
+    id: str,
+    name: str,
+    description: Optional[str] = None,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> dict[str, Any]:
+    """Insert a project and return it (with session_count = 0)."""
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO projects (id, name, description) VALUES (?, ?, ?)",
+            (id, name, description),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    created = get_project(id, db_path=db_path)
+    assert created is not None  # just inserted
+    return created
+
+
+def list_projects(db_path: Path = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+    """All projects (alphabetical) with how many sessions each one holds."""
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT p.id, p.name, p.description, p.created_at,
+                   COUNT(s.id) AS session_count
+            FROM projects p
+            LEFT JOIN sessions s ON s.project_id = p.id
+            GROUP BY p.id
+            ORDER BY p.name COLLATE NOCASE
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_project(project_id: str, db_path: Path = DEFAULT_DB_PATH) -> Optional[dict[str, Any]]:
+    """One project (with session_count), or None if it doesn't exist."""
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT p.id, p.name, p.description, p.created_at,
+                   COUNT(s.id) AS session_count
+            FROM projects p
+            LEFT JOIN sessions s ON s.project_id = p.id
+            WHERE p.id = ?
+            GROUP BY p.id
+            """,
+            (project_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row is not None else None
+
+
+def find_project_by_name(name: str, db_path: Path = DEFAULT_DB_PATH) -> Optional[dict[str, Any]]:
+    """Case-insensitive exact-name lookup, used to stop duplicate project names."""
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT id, name, description, created_at FROM projects WHERE name = ? COLLATE NOCASE",
+            (name,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row is not None else None
+
+
+def set_session_project(
+    session_id: str,
+    project_id: Optional[str],
+    db_path: Path = DEFAULT_DB_PATH,
+) -> bool:
+    """Move a session into a project (or out of one with project_id=None).
+    Returns False if the session id doesn't exist. The caller is expected to
+    have checked that project_id exists (foreign keys are enforced).
+    """
+    conn = _connect(db_path)
+    try:
+        cursor = conn.execute(
+            "UPDATE sessions SET project_id = ? WHERE id = ?",
+            (project_id, session_id),
+        )
         conn.commit()
         return cursor.rowcount > 0
     finally:

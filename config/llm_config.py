@@ -180,6 +180,39 @@ def get_llm(
     return LLM(**kwargs)
 
 
+def describe_evaluator_llm(temperatures: dict[str, float] | None = None) -> dict:
+    """Secret-free snapshot of which provider/model EvalMind's own agents use,
+    for recording alongside a session (shown in the report's "AI / Session
+    Details" card). Never builds an LLM and never reads an API key, so it can
+    be called even when no key is configured.
+
+    `temperatures` maps role -> the temperature that role REQUESTS. A role whose
+    model rejects an explicit temperature (see _rejects_explicit_temperature)
+    is reported as None ("provider default") instead of the requested value,
+    so the report never claims a temperature that was silently dropped.
+
+    Returns {evaluation_provider, evaluation_models, temperatures}.
+    """
+    provider = _get_provider()
+    models = {role: _resolve_model(provider, role) for role in ("describer", "generator", "judge")}
+    # The Aggregator builds its LLM without a role, so it uses the plain default.
+    models["aggregator"] = _resolve_model(provider, None)
+
+    effective: dict[str, float | None] = {}
+    for role, requested in (temperatures or {}).items():
+        model = models.get(role)
+        if model is None or _rejects_explicit_temperature(provider, model):
+            effective[role] = None
+        else:
+            effective[role] = requested
+
+    return {
+        "evaluation_provider": provider,
+        "evaluation_models": models,
+        "temperatures": effective,
+    }
+
+
 def is_configured() -> bool:
     """True if the currently-selected provider has a non-empty API key set. Never raises."""
     try:

@@ -1,13 +1,33 @@
 -- EvalMind SQLite schema
 --
+-- projects: an organizational layer ABOVE sessions. A project groups related
+--           evaluation sessions (e.g. all runs against one product). A session
+--           still has its own unique id -- the project is purely additive.
 -- sessions: one row per evaluation run against a given AUT (Agent Under Test).
 -- rounds:   one row per individual test round within a session, scoped to one
 --           of the three evaluation categories (functionality/security/compliance).
+--
+-- Hierarchy:  Project -> Sessions -> Rounds
+--
+-- NOTE: columns added to `sessions` after the first release (agent_brief,
+-- project_id, session_meta) are also applied to already-existing databases by
+-- db.store._migrate_add_session_columns(), since CREATE TABLE IF NOT EXISTS
+-- never alters a table that already exists.
+
+CREATE TABLE IF NOT EXISTS projects (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    description TEXT,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 
 CREATE TABLE IF NOT EXISTS sessions (
     id              TEXT PRIMARY KEY,
     aut_description TEXT NOT NULL,
-    started_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    started_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    agent_brief     TEXT,      -- optional free-text brief the user gave about the agent
+    project_id      TEXT REFERENCES projects(id) ON DELETE SET NULL,
+    session_meta    TEXT       -- JSON: connection + run configuration snapshot (never secrets)
 );
 
 CREATE TABLE IF NOT EXISTS rounds (

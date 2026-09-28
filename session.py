@@ -39,14 +39,17 @@ and it's also what lets tests/test_describer.py isolate "does auto-discovery
 work" from "does the escalating loop work" as separate concerns.
 """
 import uuid
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
 
-from aggregator import FinalReport, build_final_report
-from agents.describer import compare_descriptions, describe_aut
+from aggregator import AGGREGATOR_TEMPERATURE, FinalReport, build_final_report
+from agents.describer import DESCRIBER_TEMPERATURE, compare_descriptions, describe_aut
+from agents.generator import GENERATOR_TEMPERATURE
+from agents.judge import JUDGE_TEMPERATURE, PASS_THRESHOLD
 from agents.schemas import DescriptionComparisonResult, DescriberResult
 from aut.connector import AUTConfig
+from config.llm_config import describe_evaluator_llm
 from db.store import get_rounds_for_session, init_db, insert_session, update_session_description
 from loop_runner import CategoryLoopResult, run_category_loop
 from progress import OnEvent, emit_event
@@ -105,6 +108,49 @@ class SessionResult(BaseModel):
     failed_categories: List[str] = []
 
 
+def _build_session_meta(
+    connection_meta: Optional[Dict[str, Any]],
+    max_rounds: int,
+    categories: Optional[list],
+    start_difficulty: int,
+    max_difficulty: int,
+    pass_threshold: Optional[int],
+) -> Dict[str, Any]:
+    """Secret-free snapshot of how this session was run, stored on the session
+    row and surfaced in the report's "AI / Session Details" and "Agent Profile"
+    cards. Only facts that are actually known here go in: the caller's connection
+    info (endpoint, auth type -- see backend/app/main.py::_connection_meta),
+    the run settings, and which models/temperatures EvalMind's own agents use.
+    Nothing is guessed; a key that can't be determined is simply left out, and
+    the UI shows only the keys that exist.
+    """
+    meta: Dict[str, Any] = dict(connection_meta or {})
+    meta.update(
+        {
+            "framework": "CrewAI",
+            "max_rounds": max_rounds,
+            "categories_requested": list(categories) if categories else list(CATEGORIES),
+            "start_difficulty": start_difficulty,
+            "max_difficulty": max_difficulty,
+            "pass_threshold": pass_threshold if pass_threshold is not None else PASS_THRESHOLD,
+        }
+    )
+    try:
+        meta.update(
+            describe_evaluator_llm(
+                {
+                    "generator": GENERATOR_TEMPERATURE,
+                    "judge": JUDGE_TEMPERATURE,
+                    "describer": DESCRIBER_TEMPERATURE,
+                    "aggregator": AGGREGATOR_TEMPERATURE,
+                }
+            )
+        )
+    except Exception:  # noqa: BLE001 - a bad LLM_PROVIDER must not stop the run; it fails loudly later anyway
+        pass
+    return meta
+
+
 def run_full_session(
     aut_config: AUTConfig,
     max_rounds: int = 5,
@@ -115,6 +161,9 @@ def run_full_session(
     max_difficulty: int = 5,
     pass_threshold: Optional[int] = None,
     user_capability_description: Optional[str] = None,
+    agent_brief: Optional[str] = None,
+    project_id: Optional[str] = None,
+    connection_meta: Optional[Dict[str, Any]] = None,
 ) -> SessionResult:
     """
     Run the full EvalMind evaluation: auto-discover the AUT's capability
@@ -188,15 +237,25 @@ def run_full_session(
         describer_result: Optional[DescriberResult] = None
         comparison_result: Optional[DescriptionComparisonResult] = None
         session_id = str(uuid.uuid4())
+        # Extra columns written with the session row: the optional "Agent / Chatbot
+        # Brief" (report context only), the project grouping (session_id stays the
+        # session's own unique id), and the secret-free run/connection snapshot.
+        session_row_extras: Dict[str, Any] = {
+            "agent_brief": (agent_brief or "").strip() or None,
+            "project_id": project_id or None,
+            "session_meta": _build_session_meta(
+                connection_meta, max_rounds, categories, start_difficulty, max_difficulty, pass_threshold
+            ),
+        }
         if capability_description_override is not None:
             if not capability_description_override.strip():
                 raise ValueError("capability_description_override must be a non-empty string if provided")
             capability_description = capability_description_override
-            insert_session(session_id, aut_description=capability_description)
+            insert_session(session_id, aut_description=capability_description, **session_row_extras)
         elif user_capability_description and user_capability_description.strip():
             # User provided a description via the optional chatbox — compare
             # it with the AUT's own self-report before proceeding.
-            insert_session(session_id, aut_description=_DISCOVERY_PENDING_DESCRIPTION)
+            insert_session(session_id, aut_description=_DISCOVERY_PENDING_DESCRIPTION, **session_row_extras)
             try:
                 comparison_result = compare_descriptions(
                     user_description=user_capability_description.strip(),
@@ -215,7 +274,7 @@ def run_full_session(
             # placeholder description) so a run that dies during discovery still
             # leaves a trace in the DB and the history panel instead of nothing
             # at all; the real description replaces the placeholder below.
-            insert_session(session_id, aut_description=_DISCOVERY_PENDING_DESCRIPTION)
+            insert_session(session_id, aut_description=_DISCOVERY_PENDING_DESCRIPTION, **session_row_extras)
             try:
                 describer_result = describe_aut(aut_config, on_event=on_event)
             except Exception as e:

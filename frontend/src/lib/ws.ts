@@ -133,6 +133,42 @@ export interface FinalReport {
   performance_and_cost: PerformanceAndCost;
   /** Categories cut short by an error (partial run). Optional/absent on older reports. */
   incomplete_categories?: string[];
+
+  // --- Session context (all optional: absent/null on sessions recorded before
+  // these existed, and the report UI only renders what is actually present). ---
+  /** The user's optional "Agent / Chatbot Brief". */
+  agent_brief?: string | null;
+  project_id?: string | null;
+  project_name?: string | null;
+  /** Seconds from session start to the last recorded round. */
+  duration_seconds?: number | null;
+  /** Secret-free connection + run settings snapshot taken when the session started. */
+  session_meta?: SessionMeta | null;
+}
+
+/** Mirrors the dict built by session.py::_build_session_meta (which merges in
+ * backend/app/main.py::_connection_meta). Every key is optional because older
+ * sessions have none of them and the UI must never invent a missing value. */
+export interface SessionMeta {
+  agent_name?: string;
+  agent_type?: string;
+  /** Human-readable connection type, e.g. "HTTP / REST". */
+  connection_mode?: string;
+  /** scheme://host/path only — credentials and query strings are stripped server-side. */
+  endpoint?: string;
+  /** The KIND of auth configured (never a credential). */
+  auth?: string;
+  framework?: string;
+  evaluation_provider?: string;
+  /** role (describer/generator/judge/aggregator) -> model id. */
+  evaluation_models?: Record<string, string>;
+  /** role -> temperature actually applied; null means the provider default was used. */
+  temperatures?: Record<string, number | null>;
+  max_rounds?: number;
+  categories_requested?: string[];
+  start_difficulty?: number;
+  max_difficulty?: number;
+  pass_threshold?: number;
 }
 
 // ==========================================================================
@@ -261,6 +297,10 @@ export interface SessionSummary {
   aut_description: string;
   started_at: string;
   has_report: boolean;
+  project_id?: string | null;
+  project_name?: string | null;
+  /** Display name recorded at session start; absent on older sessions. */
+  agent_name?: string | null;
 }
 
 /** GET /api/sessions \u2014 list recent sessions, newest first. */
@@ -286,4 +326,59 @@ export async function rejudgeSession(sessionId: string): Promise<FinalReport> {
   );
   if (!res.ok) throw new Error(`POST rejudge for ${sessionId} failed: HTTP ${res.status}`);
   return (await res.json()) as FinalReport;
+}
+
+// ==========================================================================
+// Projects — an organizational layer above sessions (Project -> Sessions ->
+// Rounds). A session keeps its own session_id; a project only groups them.
+// ==========================================================================
+
+/** Mirrors backend ProjectSummary — one row from GET /api/projects. */
+export interface Project {
+  id: string;
+  name: string;
+  description: string | null;
+  created_at: string;
+  session_count: number;
+}
+
+/** Pulls FastAPI's `detail` message out of an error response, falling back to
+ * the HTTP status, so e.g. a duplicate project name shows its real reason. */
+async function errorMessage(res: Response, fallback: string): Promise<string> {
+  try {
+    const body = (await res.json()) as { detail?: unknown };
+    if (typeof body.detail === "string" && body.detail) return body.detail;
+  } catch {
+    // Not JSON — fall through to the generic message.
+  }
+  return `${fallback}: HTTP ${res.status}`;
+}
+
+/** GET /api/projects — all projects with their session counts. */
+export async function fetchProjects(): Promise<Project[]> {
+  const res = await fetch(`${BACKEND_HTTP_URL}/api/projects`);
+  if (!res.ok) throw new Error(await errorMessage(res, "GET /api/projects failed"));
+  return (await res.json()) as Project[];
+}
+
+/** POST /api/projects — create a project (names are unique, case-insensitive). */
+export async function createProject(name: string, description: string | null): Promise<Project> {
+  const res = await fetch(`${BACKEND_HTTP_URL}/api/projects`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, description }),
+  });
+  if (!res.ok) throw new Error(await errorMessage(res, "Could not create project"));
+  return (await res.json()) as Project;
+}
+
+/** PUT /api/sessions/{id}/project — file an existing session under a project
+ * (null unfiles it). */
+export async function assignSessionProject(sessionId: string, projectId: string | null): Promise<void> {
+  const res = await fetch(`${BACKEND_HTTP_URL}/api/sessions/${encodeURIComponent(sessionId)}/project`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project_id: projectId }),
+  });
+  if (!res.ok) throw new Error(await errorMessage(res, "Could not update the session's project"));
 }

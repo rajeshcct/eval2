@@ -1,5 +1,8 @@
 import { useState } from "react";
 import SessionHistoryPanel from "./SessionHistoryPanel";
+import OrganizeSessionPanel from "./OrganizeSessionPanel";
+import ProjectsPanel from "./ProjectsPanel";
+import type { ProjectTarget } from "./OrganizeSessionPanel";
 import type {
   AUTConnectionRequest,
   BrowserConnectionRequest,
@@ -26,6 +29,9 @@ interface NewSessionFormProps {
    * /api/sessions/{id}/report without starting anything. */
   onLoadReport: (sessionId: string) => void;
   disabled?: boolean;
+  /** Project to have pre-selected in "Organize this evaluation" (e.g. when
+   * starting another session from a report that belongs to a project). */
+  initialProject?: ProjectTarget | null;
 }
 
 /**
@@ -54,7 +60,7 @@ interface NewSessionFormProps {
  * load (see App.tsx) — lets a finished report be reopened from the
  * landing page without needing to hand-edit a URL.
  */
-export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewSessionFormProps) {
+export default function NewSessionForm({ onStart, onLoadReport, disabled, initialProject }: NewSessionFormProps) {
   const [connectionMode, setConnectionMode] = useState<"http" | "socketio" | "swagger" | "browser">(
     "http",
   );
@@ -84,6 +90,13 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
   const [reloadSessionId, setReloadSessionId] = useState("");
   const [userDescription, setUserDescription] = useState<string>("");
   const [showUserDescription, setShowUserDescription] = useState(false);
+  // Project the next-started session is filed under (chosen in "Organize this
+  // evaluation" at the bottom of the page). null = not filed.
+  const [projectTarget, setProjectTarget] = useState<ProjectTarget | null>(initialProject ?? null);
+  // Bumped whenever a project is created or a session is moved/deleted, so the
+  // Projects list above Past Sessions reloads.
+  const [listRefresh, setListRefresh] = useState(0);
+  const bumpLists = () => setListRefresh((n) => n + 1);
 
   // Evaluation control
   const ALL_CATEGORIES = ["functionality", "security", "compliance"] as const;
@@ -240,9 +253,73 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
       max_difficulty: maxDifficulty !== 5 ? maxDifficulty : null,
       pass_threshold: passThreshold !== 6 ? passThreshold : null,
       user_capability_description: userDescription.trim() ? userDescription.trim() : null,
+      // The same "Describe your chatbot" text is also stored as the session's
+      // description, so it shows up as the Description in the report's Agent Profile.
+      agent_brief: userDescription.trim() ? userDescription.trim() : null,
+      project_id: projectTarget ? projectTarget.id : null,
     };
     onStart(request);
   }
+
+  // "Describe your chatbot": the one optional description field, shared by every
+  // connection type. In HTTP / REST mode it sits between the chat endpoint URL and
+  // the login toggle; in the other modes it follows that mode's own fields (see
+  // the two places it is rendered below). It is also what the report shows as the
+  // agent's Description.
+  const describeChatbotField = (
+    <div className="rounded-md border border-slate-800 bg-slate-900/30 p-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className="text-lg">💬</span>
+          <span className="text-sm font-medium text-slate-200">Describe your chatbot</span>
+          <span className="rounded-full bg-slate-700/60 px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-400">Optional</span>
+        </div>
+        <button
+          type="button"
+          onClick={() => setShowUserDescription((v) => !v)}
+          className={`rounded-md border px-3 py-1.5 text-xs font-medium transition-colors ${
+            showUserDescription
+              ? "border-cyan-500 bg-cyan-600/20 text-cyan-200"
+              : "border-slate-700 bg-slate-800 text-slate-300 hover:bg-slate-700"
+          }`}
+        >
+          {showUserDescription ? "Hide" : "Enable"}
+        </button>
+      </div>
+      {!showUserDescription && (
+        <p className="mt-2 text-xs text-slate-500">
+          Tell EvalMind what your chatbot does. It will also ask the chatbot itself
+          and compare both answers — generating smarter evaluation questions.
+        </p>
+      )}
+      {showUserDescription && (
+        <div className="mt-3 flex flex-col gap-2">
+          <textarea
+            id="user_capability_description"
+            rows={4}
+            maxLength={DESCRIPTION_MAX}
+            placeholder="e.g. A customer-support chatbot for a logistics company that helps users track shipments, answer delivery questions, and raise support tickets."
+            value={userDescription}
+            onChange={(e) => setUserDescription(e.target.value)}
+            className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500"
+          />
+          {userDescription.length > DESCRIPTION_MAX - 200 && (
+            <p className="text-right font-mono text-[11px] text-slate-500">
+              {userDescription.length}/{DESCRIPTION_MAX}
+            </p>
+          )}
+          <div className="rounded-md border border-cyan-900/40 bg-cyan-950/20 px-3 py-2">
+            <p className="text-xs text-cyan-400">
+              <strong>How it works:</strong> EvalMind will ask your chatbot “What can you do?”
+              and compare its answer with your description. If they differ significantly,
+              you’ll see a warning before evaluation starts. Both descriptions are combined
+              to generate more targeted test questions.
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 
   function handleLoadReport() {
     const trimmed = reloadSessionId.trim();
@@ -250,61 +327,13 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
   }
 
   return (
-    <div className="mx-auto flex w-full max-w-xl flex-col gap-10">
+    <div className="mx-auto flex w-full max-w-[850px] flex-col gap-10">
       <form onSubmit={handleSubmit} className="flex w-full flex-col gap-6">
         <div>
           <h1 className="text-2xl font-semibold text-slate-50">New Evaluation Session</h1>
           <p className="mt-1 text-sm text-slate-400">
             Point EvalMind at an Agent Under Test and start a live evaluation.
           </p>
-        </div>
-
-        {/* Optional chatbot description */}
-        <div className="rounded-md border border-slate-800 bg-slate-900/30 p-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <span className="text-lg">💬</span>
-              <span className="text-sm font-medium text-slate-200">Describe your chatbot</span>
-              <span className="rounded-full bg-slate-700/60 px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-400">Optional</span>
-            </div>
-            <button
-              type="button"
-              onClick={() => setShowUserDescription((v) => !v)}
-              className={`rounded-md border px-3 py-1.5 text-xs font-medium transition-colors ${
-                showUserDescription
-                  ? "border-cyan-500 bg-cyan-600/20 text-cyan-200"
-                  : "border-slate-700 bg-slate-800 text-slate-300 hover:bg-slate-700"
-              }`}
-            >
-              {showUserDescription ? "Hide" : "Enable"}
-            </button>
-          </div>
-          {!showUserDescription && (
-            <p className="mt-2 text-xs text-slate-500">
-              Tell EvalMind what your chatbot does. It will also ask the chatbot itself
-              and compare both answers — generating smarter evaluation questions.
-            </p>
-          )}
-          {showUserDescription && (
-            <div className="mt-3 flex flex-col gap-2">
-              <textarea
-                id="user_capability_description"
-                rows={4}
-                placeholder="e.g. This is a customer support chatbot for an e-commerce platform. It can help with order tracking, returns, product recommendations, and FAQ. It should not reveal internal pricing strategies or customer data."
-                value={userDescription}
-                onChange={(e) => setUserDescription(e.target.value)}
-                className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500"
-              />
-              <div className="rounded-md border border-cyan-900/40 bg-cyan-950/20 px-3 py-2">
-                <p className="text-xs text-cyan-400">
-                  <strong>How it works:</strong> EvalMind will ask your chatbot “What can you do?”
-                  and compare its answer with your description. If they differ significantly,
-                  you’ll see a warning before evaluation starts. Both descriptions are combined
-                  to generate more targeted test questions.
-                </p>
-              </div>
-            </div>
-          )}
         </div>
 
         <div className="flex flex-col gap-2">
@@ -379,6 +408,8 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
                 className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
               />
             </div>
+
+            {describeChatbotField}
 
             <div className="flex items-center justify-between rounded-md border border-slate-800 bg-slate-900/50 px-3 py-2">
               <label htmlFor="requires_login" className="text-sm font-medium text-slate-200">
@@ -985,6 +1016,8 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
           </>
         )}
 
+        {connectionMode !== "http" && describeChatbotField}
+
         <div className="flex flex-col gap-2">
           <label htmlFor="max_rounds" className="text-sm font-medium text-slate-200">
             Max rounds per category
@@ -1162,6 +1195,19 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
         >
           {disabled ? "Starting…" : "Start Evaluation"}
         </button>
+
+        {projectTarget && (
+          <p className="-mt-3 text-xs text-slate-500">
+            Will be saved to project <span className="text-slate-300">{projectTarget.name}</span>.{" "}
+            <button
+              type="button"
+              onClick={() => setProjectTarget(null)}
+              className="text-indigo-400 hover:text-indigo-300"
+            >
+              Remove
+            </button>
+          </p>
+        )}
       </form>
 
       <div className="flex flex-col gap-2 border-t border-slate-800 pt-6">
@@ -1196,14 +1242,29 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled }: NewS
         </p>
       </div>
 
+      {/* Projects */}
+      <div className="flex flex-col gap-3 border-t border-slate-800 pt-6">
+        <h2 className="text-sm font-medium text-slate-200">Projects</h2>
+        <ProjectsPanel onViewReport={onLoadReport} refreshKey={listRefresh} onChanged={bumpLists} />
+      </div>
+
       {/* Session history */}
       <div className="flex flex-col gap-3 border-t border-slate-800 pt-6">
         <h2 className="text-sm font-medium text-slate-200">Past Sessions</h2>
-        <SessionHistoryPanel onViewReport={onLoadReport} />
+        <SessionHistoryPanel onViewReport={onLoadReport} onChanged={bumpLists} refreshKey={listRefresh} />
       </div>
+
+      <OrganizeSessionPanel
+        target={projectTarget}
+        onTargetChange={setProjectTarget}
+        onProjectCreated={bumpLists}
+      />
     </div>
   );
 }
+
+/** Mirrors the backend's max_length on SessionStartRequest.agent_brief. */
+const DESCRIPTION_MAX = 2000;
 
 function defaultSocketioConnectionRequest_safe(): SocketIOConnectionRequest {
   return defaultSocketIOConnectionRequest();

@@ -55,7 +55,14 @@ from pydantic import BaseModel
 
 from agents.judge import PASS_THRESHOLD
 from config.llm_config import get_llm
-from db.store import DEFAULT_DB_PATH, get_final_report, get_rounds_for_session, get_session, insert_final_report
+from db.store import (
+    DEFAULT_DB_PATH,
+    get_final_report,
+    get_project,
+    get_rounds_for_session,
+    get_session,
+    insert_final_report,
+)
 
 CATEGORIES = ("functionality", "security", "compliance")
 VALID_STATUSES = ("broken", "robust_within_tested_range")
@@ -188,6 +195,24 @@ class FinalReport(BaseModel):
     # a normal, complete run. Categories that never started at all are simply
     # absent from `categories`. Optional/defaulted for backward compatibility.
     incomplete_categories: List[str] = []
+
+    # --- Session context. All optional/defaulted so reports stored before these
+    # fields existed keep validating unchanged. They are derived from the
+    # sessions/rounds tables (see compute_session_extras), and the GET report
+    # endpoint refreshes them on read so older sessions get them too. ---
+    # The user's optional free-text brief about the agent ("Agent / Chatbot Brief").
+    agent_brief: Optional[str] = None
+    # The project this session is grouped under, if any.
+    project_id: Optional[str] = None
+    project_name: Optional[str] = None
+    # Wall-clock seconds from session start to the last recorded round. None when
+    # there are no rounds to measure from.
+    duration_seconds: Optional[float] = None
+    # Secret-free snapshot of the connection + run settings captured when the
+    # session started (endpoint, auth type, models, temperatures, max rounds...).
+    # None for sessions recorded before this existed; the UI shows only the keys
+    # that are actually present.
+    session_meta: Optional[Dict[str, Any]] = None
 
 
 # ==========================================================================
@@ -348,6 +373,7 @@ def _build_verdict_prompt(
     aut_description: str,
     categories: Dict[str, CategoryReport],
     incomplete_categories: Optional[List[str]] = None,
+    agent_brief: Optional[str] = None,
 ) -> str:
     incomplete = set(incomplete_categories or [])
     not_tested = [c for c in CATEGORIES if c not in categories]
@@ -359,6 +385,17 @@ def _build_verdict_prompt(
         "",
         "Per-category results (functionality / security / compliance):",
     ]
+    if agent_brief and agent_brief.strip():
+        # lines[0] is the intro, lines[1] the AUT line, lines[2] a blank spacer:
+        # slot the brief in right after the AUT line. It is the owner's own
+        # description, so it is framed as unverified context, never as evidence.
+        lines.insert(
+            2,
+            "The owner's own brief of this agent (unverified context only -- use it to "
+            "judge whether the results are relevant to its purpose, never as evidence of "
+            f"how it behaved): {agent_brief.strip()}",
+        )
+
     for category in CATEGORIES:
         report = categories.get(category)
         if report is None:
@@ -420,8 +457,9 @@ def _generate_overall_verdict(
     aut_description: str,
     categories: Dict[str, CategoryReport],
     incomplete_categories: Optional[List[str]] = None,
+    agent_brief: Optional[str] = None,
 ) -> str:
-    prompt = _build_verdict_prompt(aut_description, categories, incomplete_categories)
+    prompt = _build_verdict_prompt(aut_description, categories, incomplete_categories, agent_brief)
     llm = get_llm(temperature=AGGREGATOR_TEMPERATURE)
 
     last_error: Optional[Exception] = None
@@ -484,6 +522,73 @@ def _cross_check_against_in_memory(
                 f"in-memory status={summary_status!r} breaking_point={summary_breaking_point!r}. "
                 f"The DB-derived report is what was used; this indicates a possible persistence bug."
             )
+
+
+# ==========================================================================
+# Session context (brief, project, duration, run settings) -- derived from the
+# sessions/rounds tables, never from in-memory state, same as the rest of the
+# report. Also exposed as compute_session_extras() so the GET report endpoint
+# can refresh these on read for reports stored before they existed.
+# ==========================================================================
+def _decode_json_object(raw: Any) -> Optional[Dict[str, Any]]:
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    """Parse the DB's ISO-8601 timestamps ('...Z' suffix). None if unparseable."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _duration_seconds(started_at: Any, rows: List[Dict[str, Any]]) -> Optional[float]:
+    """Session start -> last round written. Measured from round timestamps (not
+    from the report's generated_at) so a later re-judge, which rebuilds the
+    report, doesn't change how long the evaluation itself took."""
+    start = _parse_timestamp(started_at)
+    ends = [t for t in (_parse_timestamp(r.get("created_at")) for r in rows) if t is not None]
+    if start is None or not ends:
+        return None
+    seconds = (max(ends) - start).total_seconds()
+    return round(seconds, 1) if seconds >= 0 else None
+
+
+def _session_extras(session_row: Dict[str, Any], rows: List[Dict[str, Any]], db_path: Path) -> Dict[str, Any]:
+    brief = (session_row.get("agent_brief") or "").strip() or None
+    project_id = session_row.get("project_id") or None
+    project_name: Optional[str] = None
+    if project_id:
+        project = get_project(project_id, db_path=db_path)
+        project_name = project["name"] if project else None
+    return {
+        "agent_brief": brief,
+        "project_id": project_id,
+        "project_name": project_name,
+        "duration_seconds": _duration_seconds(session_row.get("started_at"), rows),
+        "session_meta": _decode_json_object(session_row.get("session_meta")),
+    }
+
+
+def compute_session_extras(session_id: str, db_path: Path = DEFAULT_DB_PATH) -> Dict[str, Any]:
+    """The FinalReport session-context fields for a session, read fresh from the
+    DB. Returns {} if the session doesn't exist. Cheap: no LLM call."""
+    session_row = get_session(session_id, db_path=db_path)
+    if session_row is None:
+        return {}
+    rows = get_rounds_for_session(session_id, db_path=db_path)
+    return _session_extras(session_row, rows, db_path)
 
 
 def _previously_stored_incomplete(session_id: str, db_path: Path) -> List[str]:
@@ -577,7 +682,10 @@ def build_final_report(
         _cross_check_against_in_memory(categories, category_summaries)
 
     performance_and_cost = _aggregate_performance_and_cost(rows)
-    overall_verdict = _generate_overall_verdict(session_row["aut_description"], categories, incomplete)
+    extras = _session_extras(session_row, rows, db_path)
+    overall_verdict = _generate_overall_verdict(
+        session_row["aut_description"], categories, incomplete, agent_brief=extras["agent_brief"]
+    )
 
     report = FinalReport(
         session_id=session_id,
@@ -588,6 +696,7 @@ def build_final_report(
         categories=categories,
         performance_and_cost=performance_and_cost,
         incomplete_categories=incomplete,
+        **extras,
     )
 
     insert_final_report(session_id=session_id, report_json=report.model_dump_json(), db_path=db_path)

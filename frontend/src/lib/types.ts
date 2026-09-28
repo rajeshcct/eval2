@@ -265,4 +265,11 @@ export interface SessionStartRequest {
    * EvalMind also asks the chatbot itself and compares both descriptions
    * before generating evaluation questions. */
   user_capability_description?: string | null;
+  /** Optional free-text "Agent / Chatbot Brief". Stored with the session and
+   * shown in the report's Agent Profile; also given to the verdict prompt as
+   * context. Unlike user_capability_description it does NOT change how the
+   * evaluation itself runs. */
+  agent_brief?: string | null;
+  /** Project to file this session under (chosen in "Organize this evaluation"). */
+  project_id?: string | null;
 }

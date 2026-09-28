@@ -5,6 +5,7 @@ import ReportView from "./components/ReportView";
 import { fetchSessionReport, startRun, sendWsMessage } from "./lib/ws";
 import type { FinalReport, ProgressEvent, DescriptionComparisonResult } from "./lib/ws";
 import type { SessionStartRequest } from "./lib/types";
+import type { ProjectTarget } from "./components/OrganizeSessionPanel";
 
 /**
  * App shell with three states (form -> live -> report), held in React
@@ -53,6 +54,9 @@ export default function App() {
   const [reportStatus, setReportStatus] = useState<ReportStatus>("loaded");
   const [reportError, setReportError] = useState<string | null>(null);
   const [pendingSessionId, setPendingSessionId] = useState<string | null>(null);
+  // Project to pre-select on the New Session form (set by "Start another session"
+  // on a report that belongs to a project). Cleared by handleReset.
+  const [presetProject, setPresetProject] = useState<ProjectTarget | null>(null);
   // Raw WS-level failure (e.g. connection refused) — distinct from a
   // well-formed `error` ProgressEvent, which LiveRunView renders itself by
   // deriving from `events`.
@@ -224,12 +228,20 @@ export default function App() {
     setReportError(null);
     setPendingSessionId(null);
     setSessionIdInUrl(null);
+    setPresetProject(null);
+  }
+
+  /** "Start another session" from a report: back to a fresh form, with the same
+   * project already chosen when the report's session was in one. */
+  function handleStartAnother(project: ProjectTarget | null) {
+    handleReset();
+    setPresetProject(project);
   }
 
   return (
-    <div className="min-h-screen px-4 py-12">
+    <div className="min-h-screen px-4 py-12 sm:px-[4vw] print:px-4">
       {state === "form" && (
-        <div className="mx-auto flex w-full max-w-xl flex-col gap-4">
+        <div className="mx-auto flex w-full max-w-[1450px] flex-col gap-4">
           {socketError && (
             <div
               role="alert"
@@ -238,7 +250,12 @@ export default function App() {
               {socketError}
             </div>
           )}
-          <NewSessionForm onStart={handleStart} onLoadReport={loadReportById} disabled={starting} />
+          <NewSessionForm
+            onStart={handleStart}
+            onLoadReport={loadReportById}
+            disabled={starting}
+            initialProject={presetProject}
+          />
         </div>
       )}
 
@@ -290,7 +307,7 @@ export default function App() {
       )}
 
       {state === "report" && reportStatus === "loaded" && finalReport && (
-        <ReportView report={finalReport} onReset={handleReset} />
+        <ReportView report={finalReport} onReset={handleReset} onStartAnother={handleStartAnother} />
       )}
     </div>
   );
