@@ -48,6 +48,10 @@ from db.store import (
     get_project,
     list_projects,
     set_session_project,
+    create_user,
+    verify_user,
+    get_user_count,
+    get_user_by_id,
 )
 from session import run_full_session
 
@@ -99,11 +103,119 @@ async def _check_api_key(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing X-EvalMind-Key header.")
 
 
+# ==========================================================================
+# Simple token-based auth (stateless signed tokens stored server-side in
+# memory for the lifetime of the process).
+# ==========================================================================
+import secrets as _secrets
+import time as _time
+
+# token_store: {token: {user_id, username, display_name, issued_at}}
+_token_store: Dict[str, Dict[str, Any]] = {}
+_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7  # 7 days
+
+
+def _issue_token(user: dict) -> str:
+    token = _secrets.token_urlsafe(48)
+    _token_store[token] = {
+        "user_id": user["id"],
+        "username": user["username"],
+        "display_name": user.get("display_name") or user["username"],
+        "issued_at": _time.time(),
+    }
+    return token
+
+
+def _resolve_token(request: Request) -> Optional[Dict[str, Any]]:
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:]
+        entry = _token_store.get(token)
+        if entry and (_time.time() - entry["issued_at"]) < _TOKEN_TTL_SECONDS:
+            return entry
+    return None
+
+
+async def _require_auth(request: Request) -> Dict[str, Any]:
+    """FastAPI dependency: returns the current user or raises 401."""
+    user = _resolve_token(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Not authenticated. Please log in.")
+    return user
+
+
+# ==========================================================================
+# Auth Pydantic models
+# ==========================================================================
+class RegisterRequest(BaseModel):
+    username: str = Field(..., min_length=2, max_length=40)
+    password: str = Field(..., min_length=6)
+    display_name: Optional[str] = None
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+# ==========================================================================
+# Auth endpoints
+# ==========================================================================
+@app.post("/api/auth/register")
+async def register(body: RegisterRequest):
+    """Register a new user. Open only when no users exist (first-run setup)."""
+    count = get_user_count()
+    if count > 0:
+        raise HTTPException(
+            status_code=403,
+            detail="Registration is closed. Contact an existing admin to create your account.",
+        )
+    try:
+        user = create_user(
+            username=body.username,
+            password=body.password,
+            display_name=body.display_name or body.username,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    token = _issue_token(user)
+    return {"token": token, "user": {"id": user["id"], "username": user["username"], "display_name": user.get("display_name")}}
+
+
+@app.post("/api/auth/login")
+async def login(body: LoginRequest):
+    user = verify_user(body.username, body.password)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    token = _issue_token(user)
+    return {"token": token, "user": {"id": user["id"], "username": user["username"], "display_name": user.get("display_name")}}
+
+
+@app.get("/api/auth/me")
+async def me(current_user: Dict[str, Any] = Depends(_require_auth)):
+    return {"user": current_user}
+
+
+@app.post("/api/auth/logout")
+async def logout(request: Request):
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:]
+        _token_store.pop(token, None)
+    return {"ok": True}
+
+
+@app.get("/api/auth/setup-status")
+async def setup_status():
+    """Returns whether first-time setup (registration) is still open."""
+    return {"needs_setup": get_user_count() == 0}
+
 
 # ==========================================================================
 # Request schema
 # ==========================================================================
 class SessionStartRequest(BaseModel):
+
     """The one JSON message a /ws/run client sends immediately after the
     WebSocket connects. `connection` is aut/auth.py's ConnectionRequest — a
     discriminated union (on `mode`) of either an AUTConnectionRequest

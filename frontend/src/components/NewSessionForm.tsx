@@ -27,6 +27,9 @@ interface NewSessionFormProps {
   /** Project to have pre-selected in "Organize this evaluation" (e.g. when
    * starting another session from a report that belongs to a project). */
   initialProject?: ProjectTarget | null;
+  /** When true, suppress the built-in page header (used inside the new
+   * sidebar layout where the shell provides its own heading). */
+  hideHeader?: boolean;
 }
 
 /**
@@ -55,7 +58,7 @@ interface NewSessionFormProps {
  * load (see App.tsx) — lets a finished report be reopened from the
  * landing page without needing to hand-edit a URL.
  */
-export default function NewSessionForm({ onStart, onLoadReport, disabled, initialProject }: NewSessionFormProps) {
+export default function NewSessionForm({ onStart, onLoadReport, disabled, initialProject, hideHeader }: NewSessionFormProps) {
   const [connectionMode, setConnectionMode] = useState<"http" | "socketio" | "swagger" | "browser">(
     "http",
   );
@@ -318,20 +321,22 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
   );
 
   return (
-    <div className="mx-auto flex w-full max-w-[1450px] flex-col gap-8">
+    <div className="em-landing flex w-full flex-col gap-8">
       <form onSubmit={handleSubmit} className="flex w-full flex-col gap-6">
-        <header className="border-b border-slate-800 pb-6">
-          <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-indigo-400">
-            EvalMind — AI Evaluation Workspace
-          </p>
-          <h1 className="mt-2 text-3xl font-semibold uppercase tracking-tight text-slate-50 sm:text-4xl">
-            New Evaluation
-          </h1>
-          <p className="mt-2 text-base text-slate-400">Configure an AI agent and start an evaluation.</p>
-        </header>
+        {!hideHeader && (
+          <header className="border-b border-slate-800 pb-6">
+            <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-indigo-400">
+              EvalMind — AI Evaluation Workspace
+            </p>
+            <h1 className="mt-2 text-3xl font-semibold uppercase tracking-tight text-slate-50 sm:text-4xl">
+              New Evaluation
+            </h1>
+            <p className="mt-2 text-base text-slate-400">Configure an AI agent and start an evaluation.</p>
+          </header>
+        )}
 
-        {/* Dashboard grid: connection (left) | evaluation settings (right) on wide screens */}
-        <div className="grid grid-cols-1 items-start gap-6 xl:grid-cols-[minmax(0,1fr)_400px]">
+        {/* Single-column layout: all sections stack cleanly */}
+        <div className="flex min-w-0 flex-col gap-6">
         <div className="flex min-w-0 flex-col gap-6">
         <div className="flex flex-col gap-3 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
           <span className={`${SECTION_LABEL} em-sec--conn`}>Connection type</span>
@@ -1032,42 +1037,45 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
         </div>
         </div>
 
-        <aside className="flex min-w-0 flex-col gap-6">
-        <div className="flex flex-col gap-6 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
-        <div className="border-b border-slate-800 pb-3">
-          <span className={`${SECTION_LABEL} em-sec--set`}>Evaluation settings</span>
-        </div>
+        {/* ── Evaluation settings — full width inline ─────────────────── */}
+        <div className="flex flex-col gap-4 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
+          <div className="border-b border-slate-800 pb-3">
+            <span className={`${SECTION_LABEL} em-sec--set`}>Evaluation settings</span>
+          </div>
 
-        <div className="flex flex-col gap-2">
-          <label htmlFor="max_rounds" className="text-sm font-medium text-slate-200">
-            Max rounds per category
-          </label>
-          <input
-            id="max_rounds"
-            type="number"
-            min={1}
-            max={5}
-            value={maxRounds}
-            onChange={(e) => setMaxRounds(Number(e.target.value))}
-            className="w-32 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-          />
-        </div>
+          {/* Always-visible: max rounds + advanced toggle in one row */}
+          <div className="flex flex-wrap items-end gap-6">
+            <div className="flex flex-col gap-2">
+              <label htmlFor="max_rounds" className="text-sm font-medium text-slate-200">
+                Max rounds per category
+              </label>
+              <input
+                id="max_rounds"
+                type="number"
+                min={1}
+                max={5}
+                value={maxRounds}
+                onChange={(e) => setMaxRounds(Number(e.target.value))}
+                className="w-32 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowAdvanced((v) => !v)}
+              className="mb-0.5 flex items-center gap-1.5 text-sm text-indigo-400 hover:text-indigo-300 transition-colors"
+            >
+              <svg width="14" height="14" fill="none" viewBox="0 0 24 24" className={`transition-transform ${showAdvanced ? "rotate-180" : ""}`}>
+                <path d="M19 9l-7 7-7-7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+              {showAdvanced ? "Hide advanced options" : "Show advanced options"}
+            </button>
+          </div>
 
-        <div>
-          <button
-            type="button"
-            onClick={() => setShowAdvanced((v) => !v)}
-            className="text-sm text-indigo-400 hover:text-indigo-300"
-          >
-            {showAdvanced ? "Hide advanced options" : "Show advanced options"}
-          </button>
-        </div>
-
-        {showAdvanced && (
-          <div className="flex flex-col gap-4 rounded-md border border-slate-800 bg-slate-900/30 p-4">
-            {connectionMode === "http" && (
-              <>
-                <div className="grid grid-cols-2 gap-4">
+          {/* Advanced options — expand inline below */}
+          {showAdvanced && (
+            <div className="flex flex-col gap-6 rounded-lg border border-slate-700/60 bg-slate-900/30 p-4">
+              {connectionMode === "http" && (
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
                   <div className="flex flex-col gap-2">
                     <label htmlFor="token_field" className="text-sm font-medium text-slate-200">
                       Login response token field
@@ -1092,118 +1100,99 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
                       className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                     />
                   </div>
+                  <div className="flex flex-col gap-2">
+                    <label htmlFor="timeout_seconds" className="text-sm font-medium text-slate-200">
+                      Request timeout (seconds)
+                    </label>
+                    <input
+                      id="timeout_seconds"
+                      type="number"
+                      min={1}
+                      step={1}
+                      value={connection.timeout_seconds}
+                      onChange={(e) => updateConnection("timeout_seconds", Number(e.target.value))}
+                      className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                    />
+                  </div>
                 </div>
+              )}
 
+              {/* Category selection */}
+              <div className="flex flex-col gap-2">
+                <span className="text-sm font-medium text-slate-200">Categories to evaluate</span>
+                <div className="flex flex-wrap gap-4">
+                  {ALL_CATEGORIES.map((cat) => (
+                    <label key={cat} className="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={selectedCategories.includes(cat)}
+                        onChange={() => toggleCategory(cat)}
+                        className="h-4 w-4 rounded border-slate-600 bg-slate-800 text-indigo-500 focus:ring-indigo-500"
+                      />
+                      <span className="capitalize">{cat}</span>
+                    </label>
+                  ))}
+                </div>
+                <p className="text-xs text-slate-500">Uncheck categories to skip them entirely in this run.</p>
+              </div>
+
+              {/* Difficulty + pass threshold in one row */}
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
                 <div className="flex flex-col gap-2">
-                  <label htmlFor="timeout_seconds" className="text-sm font-medium text-slate-200">
-                    Request timeout (seconds)
+                  <label htmlFor="start_difficulty" className="text-sm font-medium text-slate-200">
+                    Start difficulty <span className="text-slate-500">(1–5)</span>
                   </label>
                   <input
-                    id="timeout_seconds"
-                    type="number"
-                    min={1}
-                    step={1}
-                    value={connection.timeout_seconds}
-                    onChange={(e) => updateConnection("timeout_seconds", Number(e.target.value))}
-                    className="w-32 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                    id="start_difficulty"
+                    type="number" min={1} max={5}
+                    value={startDifficulty}
+                    onChange={(e) => setStartDifficulty(Number(e.target.value))}
+                    className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                   />
                 </div>
-              </>
-            )}
-
-            {/* Category selection */}
-            <div className="flex flex-col gap-2">
-              <span className="text-sm font-medium text-slate-200">Categories to evaluate</span>
-              <div className="flex flex-wrap gap-3">
-                {ALL_CATEGORIES.map((cat) => (
-                  <label key={cat} className="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
-                    <input
-                      type="checkbox"
-                      checked={selectedCategories.includes(cat)}
-                      onChange={() => toggleCategory(cat)}
-                      className="h-4 w-4 rounded border-slate-600 bg-slate-800 text-indigo-500 focus:ring-indigo-500"
-                    />
-                    <span className="capitalize">{cat}</span>
+                <div className="flex flex-col gap-2">
+                  <label htmlFor="max_difficulty" className="text-sm font-medium text-slate-200">
+                    Max difficulty <span className="text-slate-500">(1–5)</span>
                   </label>
-                ))}
+                  <input
+                    id="max_difficulty"
+                    type="number" min={1} max={5}
+                    value={maxDifficulty}
+                    onChange={(e) => setMaxDifficulty(Number(e.target.value))}
+                    className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  />
+                </div>
+                <div className="flex flex-col gap-2">
+                  <label htmlFor="pass_threshold" className="text-sm font-medium text-slate-200">
+                    Pass threshold <span className="text-slate-500">(1–10)</span>
+                  </label>
+                  <input
+                    id="pass_threshold"
+                    type="number" min={1} max={10}
+                    value={passThreshold}
+                    onChange={(e) => setPassThreshold(Number(e.target.value))}
+                    className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  />
+                </div>
+                <div className="flex flex-col gap-2">
+                  <label htmlFor="capability_override" className="text-sm font-medium text-slate-200 sm:col-span-4">
+                    Capability override <span className="text-slate-500">(optional)</span>
+                  </label>
+                  <textarea
+                    id="capability_override"
+                    rows={2}
+                    placeholder="Leave blank to auto-discover."
+                    value={capabilityOverride}
+                    onChange={(e) => setCapabilityOverride(e.target.value)}
+                    className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  />
+                </div>
               </div>
-              <p className="text-xs text-slate-500">Uncheck categories to skip them entirely in this run.</p>
-            </div>
-
-            {/* Difficulty range */}
-            <div className="grid grid-cols-2 gap-4">
-              <div className="flex flex-col gap-2">
-                <label htmlFor="start_difficulty" className="text-sm font-medium text-slate-200">
-                  Start difficulty <span className="text-slate-500">(1–5)</span>
-                </label>
-                <input
-                  id="start_difficulty"
-                  type="number"
-                  min={1}
-                  max={5}
-                  value={startDifficulty}
-                  onChange={(e) => setStartDifficulty(Number(e.target.value))}
-                  className="w-24 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                />
-              </div>
-              <div className="flex flex-col gap-2">
-                <label htmlFor="max_difficulty" className="text-sm font-medium text-slate-200">
-                  Max difficulty <span className="text-slate-500">(1–5)</span>
-                </label>
-                <input
-                  id="max_difficulty"
-                  type="number"
-                  min={1}
-                  max={5}
-                  value={maxDifficulty}
-                  onChange={(e) => setMaxDifficulty(Number(e.target.value))}
-                  className="w-24 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                />
-              </div>
-            </div>
-            <p className="-mt-2 text-xs text-slate-500">
-              Default: 1→5. Raise start difficulty to skip easy rounds for AUTs you know perform
-              well at low difficulties.
-            </p>
-
-            {/* Pass threshold */}
-            <div className="flex flex-col gap-2">
-              <label htmlFor="pass_threshold" className="text-sm font-medium text-slate-200">
-                Pass threshold <span className="text-slate-500">(1–10, default 6)</span>
-              </label>
-              <input
-                id="pass_threshold"
-                type="number"
-                min={1}
-                max={10}
-                value={passThreshold}
-                onChange={(e) => setPassThreshold(Number(e.target.value))}
-                className="w-24 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              />
-              <p className="text-xs text-slate-500">
-                Minimum primary-metric score (task completion / security / compliance) for a round to
-                count as PASS. Raise for stricter evaluation, lower for more lenient.
+              <p className="-mt-4 text-xs text-slate-500">
+                Default difficulty 1→5. Raise start difficulty to skip easy rounds. Pass threshold is the minimum score for a round to count as PASS.
               </p>
             </div>
-
-            <div className="flex flex-col gap-2">
-              <label htmlFor="capability_override" className="text-sm font-medium text-slate-200">
-                Capability description override <span className="text-slate-500">(optional)</span>
-              </label>
-              <textarea
-                id="capability_override"
-                rows={3}
-                placeholder="Leave blank to auto-discover the AUT's capabilities via the Describer."
-                value={capabilityOverride}
-                onChange={(e) => setCapabilityOverride(e.target.value)}
-                className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              />
-            </div>
-          </div>
-        )}
-
-        </div>
-        </aside>
+          )}
         </div>
 
         {formError && (
@@ -1227,10 +1216,13 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
         )}
       </form>
 
-      <div className="flex flex-col gap-4 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
-        <h2 className={`${SECTION_LABEL} em-sec--hist`}>Past Sessions in this Project</h2>
-        <SessionHistoryPanel onViewReport={onLoadReport} onChanged={bumpLists} refreshKey={listRefresh} projectId={projectTarget?.id} />
-      </div>
+      {/* Past sessions only shown in standalone mode (no sidebar/project workspace) */}
+      {!hideHeader && (
+        <div className="flex flex-col gap-4 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
+          <h2 className={`${SECTION_LABEL} em-sec--hist`}>Past Sessions in this Project</h2>
+          <SessionHistoryPanel onViewReport={onLoadReport} onChanged={bumpLists} refreshKey={listRefresh} projectId={projectTarget?.id} />
+        </div>
+      )}
     </div>
   );
 }

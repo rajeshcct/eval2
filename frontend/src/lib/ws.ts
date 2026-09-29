@@ -272,10 +272,18 @@ export function sendWsMessage(socket: WebSocket, message: Record<string, unknown
   }
 }
 
+/** Returns Authorization header with the stored Bearer token, or empty. */
+function authHeaders(): Record<string, string> {
+  const token = localStorage.getItem("evalmind_token");
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 /** GET /api/sessions/{session_id}/report — used by Phase V's reload path;
  * defined here now since the base URL constant lives in this module. */
 export async function fetchSessionReport(sessionId: string): Promise<FinalReport> {
-  const res = await fetch(`${BACKEND_HTTP_URL}/api/sessions/${encodeURIComponent(sessionId)}/report`);
+  const res = await fetch(`${BACKEND_HTTP_URL}/api/sessions/${encodeURIComponent(sessionId)}/report`, {
+    headers: authHeaders(),
+  });
   if (!res.ok) {
     throw new Error(`GET /api/sessions/${sessionId}/report failed: HTTP ${res.status}`);
   }
@@ -307,7 +315,7 @@ export interface SessionSummary {
 export async function fetchSessions(limit = 50, projectId?: string | null): Promise<SessionSummary[]> {
   const qs = new URLSearchParams({ limit: String(limit) });
   if (projectId) qs.set("project_id", projectId);
-  const res = await fetch(`${BACKEND_HTTP_URL}/api/sessions?${qs.toString()}`);
+  const res = await fetch(`${BACKEND_HTTP_URL}/api/sessions?${qs.toString()}`, { headers: authHeaders() });
   if (!res.ok) throw new Error(`GET /api/sessions failed: HTTP ${res.status}`);
   return (await res.json()) as SessionSummary[];
 }
@@ -316,6 +324,7 @@ export async function fetchSessions(limit = 50, projectId?: string | null): Prom
 export async function deleteSession(sessionId: string): Promise<void> {
   const res = await fetch(`${BACKEND_HTTP_URL}/api/sessions/${encodeURIComponent(sessionId)}`, {
     method: "DELETE",
+    headers: authHeaders(),
   });
   if (!res.ok) throw new Error(`DELETE /api/sessions/${sessionId} failed: HTTP ${res.status}`);
 }
@@ -324,7 +333,7 @@ export async function deleteSession(sessionId: string): Promise<void> {
 export async function rejudgeSession(sessionId: string): Promise<FinalReport> {
   const res = await fetch(
     `${BACKEND_HTTP_URL}/api/sessions/${encodeURIComponent(sessionId)}/report`,
-    { method: "POST" },
+    { method: "POST", headers: authHeaders() },
   );
   if (!res.ok) throw new Error(`POST rejudge for ${sessionId} failed: HTTP ${res.status}`);
   return (await res.json()) as FinalReport;
@@ -358,7 +367,7 @@ async function errorMessage(res: Response, fallback: string): Promise<string> {
 
 /** GET /api/projects — all projects with their session counts. */
 export async function fetchProjects(): Promise<Project[]> {
-  const res = await fetch(`${BACKEND_HTTP_URL}/api/projects`);
+  const res = await fetch(`${BACKEND_HTTP_URL}/api/projects`, { headers: authHeaders() });
   if (!res.ok) throw new Error(await errorMessage(res, "GET /api/projects failed"));
   return (await res.json()) as Project[];
 }
@@ -367,7 +376,7 @@ export async function fetchProjects(): Promise<Project[]> {
 export async function createProject(name: string, description: string | null): Promise<Project> {
   const res = await fetch(`${BACKEND_HTTP_URL}/api/projects`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({ name, description }),
   });
   if (!res.ok) throw new Error(await errorMessage(res, "Could not create project"));
@@ -379,7 +388,7 @@ export async function createProject(name: string, description: string | null): P
 export async function assignSessionProject(sessionId: string, projectId: string | null): Promise<void> {
   const res = await fetch(`${BACKEND_HTTP_URL}/api/sessions/${encodeURIComponent(sessionId)}/project`, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({ project_id: projectId }),
   });
   if (!res.ok) throw new Error(await errorMessage(res, "Could not update the session's project"));

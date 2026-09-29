@@ -15,7 +15,11 @@ body {
     linear-gradient(180deg, #080d24 0%, #060918 48%, #0a0819 100%);
   background-attachment: fixed;
   background-repeat: no-repeat;
+  /* Full-height sidebar layout: no page-level scroll */
+  height: 100dvh;
+  overflow: hidden;
 }
+
 
 /* =====================================================================
  * EvalMind — landing-page visual polish (presentation only)

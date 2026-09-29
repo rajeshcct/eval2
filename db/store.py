@@ -472,3 +472,115 @@ def get_final_report(session_id: str, db_path: Path = DEFAULT_DB_PATH) -> Option
     finally:
         conn.close()
     return dict(row) if row is not None else None
+
+
+# ==========================================================================
+# Auth — users table
+# ==========================================================================
+import hashlib
+import hmac
+import os
+import uuid as _uuid
+
+
+def _hash_password(password: str) -> str:
+    """Hash a plaintext password using PBKDF2-HMAC-SHA256 with a random salt.
+    Returns a single string: 'pbkdf2:sha256:<iterations>:<hex_salt>:<hex_hash>'
+    compatible with manual verification via _verify_password().
+    """
+    salt = os.urandom(32)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 260_000)
+    return f"pbkdf2:sha256:260000:{salt.hex()}:{key.hex()}"
+
+
+def _verify_password(password: str, stored_hash: str) -> bool:
+    """Verify a plaintext password against the stored PBKDF2 hash."""
+    try:
+        _, algo, iters_str, salt_hex, key_hex = stored_hash.split(":")
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(key_hex)
+        candidate = hashlib.pbkdf2_hmac(algo, password.encode(), salt, int(iters_str))
+        return hmac.compare_digest(candidate, expected)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _migrate_add_users_table(conn: sqlite3.Connection) -> None:
+    """Create the users table if it doesn't exist (older DBs pre-auth)."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id           TEXT PRIMARY KEY,
+            username     TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            display_name TEXT,
+            password_hash TEXT NOT NULL,
+            created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+    """)
+    conn.commit()
+
+
+def create_user(
+    username: str,
+    password: str,
+    display_name: Optional[str] = None,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> dict:
+    """Create a new user. Raises ValueError if username is taken."""
+    conn = _connect(db_path)
+    _migrate_add_users_table(conn)
+    user_id = str(_uuid.uuid4())
+    try:
+        conn.execute(
+            "INSERT INTO users (id, username, display_name, password_hash) VALUES (?, ?, ?, ?)",
+            (user_id, username.strip(), display_name or username.strip(), _hash_password(password)),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(row)
+    except sqlite3.IntegrityError:
+        raise ValueError(f"Username '{username}' is already taken.")
+    finally:
+        conn.close()
+
+
+def verify_user(
+    username: str,
+    password: str,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> Optional[dict]:
+    """Return the user row if username + password match, else None."""
+    conn = _connect(db_path)
+    _migrate_add_users_table(conn)
+    try:
+        row = conn.execute(
+            "SELECT * FROM users WHERE username = ?", (username.strip(),)
+        ).fetchone()
+        if row is None:
+            return None
+        user = dict(row)
+        if not _verify_password(password, user["password_hash"]):
+            return None
+        return user
+    finally:
+        conn.close()
+
+
+def get_user_count(db_path: Path = DEFAULT_DB_PATH) -> int:
+    """Return how many users exist — used to decide if registration is open."""
+    conn = _connect(db_path)
+    _migrate_add_users_table(conn)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def get_user_by_id(user_id: str, db_path: Path = DEFAULT_DB_PATH) -> Optional[dict]:
+    """Fetch a user by their ID, or None."""
+    conn = _connect(db_path)
+    try:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+

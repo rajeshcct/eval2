@@ -64,3 +64,16 @@ CREATE TABLE IF NOT EXISTS final_reports (
     report_json TEXT NOT NULL,
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- users: simple username / bcrypt-hashed password store for the login system.
+-- No roles or permissions yet — every authenticated user can see and run
+-- everything. The first user is created via POST /api/auth/register (open the
+-- first time, then locked behind FIRST_USER_REGISTERED flag in the DB).
+CREATE TABLE IF NOT EXISTS users (
+    id           TEXT PRIMARY KEY,
+    username     TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    display_name TEXT,
+    password_hash TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
