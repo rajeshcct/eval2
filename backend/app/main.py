@@ -649,11 +649,13 @@ async def put_session_project(
 @app.get("/api/sessions", response_model=list[SessionSummary])
 async def get_sessions(
     limit: int = 50,
+    project_id: Optional[str] = None,
     _: None = Depends(_check_api_key),
 ) -> list[SessionSummary]:
     """List up to `limit` sessions, newest first. `has_report` is True when
-    the session completed and a FinalReport was persisted for it."""
-    rows = await asyncio.to_thread(list_sessions, limit)
+    the session completed and a FinalReport was persisted for it. Pass
+    `project_id` to list only the sessions filed under that project."""
+    rows = await asyncio.to_thread(list_sessions, limit, project_id=project_id)
     return [SessionSummary(**r) for r in rows]
 
 

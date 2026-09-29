@@ -259,25 +259,35 @@ def insert_final_report(
         conn.close()
 
 
-def list_sessions(limit: int = 50, db_path: Path = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
+def list_sessions(
+    limit: int = 50,
+    db_path: Path = DEFAULT_DB_PATH,
+    project_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
     """Fetch the most-recent sessions (up to `limit`), newest first.
     Returns lightweight rows: id, aut_description, started_at.
     A final_report row existing means the session completed.
+
+    project_id: when given, only sessions filed under that project are returned
+    (the project workspace lists just its own sessions). None = every session.
     """
+    where = "WHERE s.project_id = ?" if project_id else ""
+    params: tuple[Any, ...] = (project_id, limit) if project_id else (limit,)
     conn = _connect(db_path)
     try:
         rows = conn.execute(
-            """
+            f"""
             SELECT s.id, s.aut_description, s.started_at, s.project_id, s.session_meta,
                    p.name AS project_name,
                    CASE WHEN fr.session_id IS NOT NULL THEN 1 ELSE 0 END AS has_report
             FROM sessions s
             LEFT JOIN final_reports fr ON fr.session_id = s.id
             LEFT JOIN projects p ON p.id = s.project_id
+            {where}
             ORDER BY s.started_at DESC
             LIMIT ?
             """,
-            (limit,),
+            params,
         ).fetchall()
     finally:
         conn.close()

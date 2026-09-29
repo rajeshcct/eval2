@@ -1,14 +1,11 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { resolveProjectConfig, saveProjectConfig } from "../lib/projectConfig";
 import SessionHistoryPanel from "./SessionHistoryPanel";
-import OrganizeSessionPanel from "./OrganizeSessionPanel";
-import ProjectsPanel from "./ProjectsPanel";
-import type { ProjectTarget } from "./OrganizeSessionPanel";
+import type { ProjectTarget } from "../lib/types";
 import type {
   AUTConnectionRequest,
   BrowserConnectionRequest,
   ConnectionRequest,
-  CustomEndpointConnectionRequest,
-  PublicAPIConnectionRequest,
   SessionStartRequest,
   SocketIOConnectionRequest,
   SwaggerConnectionRequest,
@@ -16,8 +13,6 @@ import type {
 import {
   defaultAUTConnectionRequest,
   defaultBrowserConnectionRequest,
-  defaultCustomEndpointConnectionRequest,
-  defaultPublicAPIConnectionRequest,
   defaultSocketIOConnectionRequest,
   defaultSwaggerConnectionRequest,
 } from "../lib/types";
@@ -68,12 +63,6 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
   const [socketioConnection, setSocketioConnection] = useState<SocketIOConnectionRequest>(
     defaultSocketioConnectionRequest_safe(),
   );
-  const [directHttpConnection, setDirectHttpConnection] = useState<CustomEndpointConnectionRequest>(
-    defaultCustomEndpointConnectionRequest(),
-  );
-  const [publicApiConnection, setPublicApiConnection] = useState<PublicAPIConnectionRequest>(
-    defaultPublicAPIConnectionRequest(),
-  );
   const [swaggerConnection, setSwaggerConnection] = useState<SwaggerConnectionRequest>(
     defaultSwaggerConnectionRequest(),
   );
@@ -87,12 +76,11 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showSocketioAdvanced, setShowSocketioAdvanced] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
-  const [reloadSessionId, setReloadSessionId] = useState("");
   const [userDescription, setUserDescription] = useState<string>("");
   const [showUserDescription, setShowUserDescription] = useState(false);
   // Project the next-started session is filed under (chosen in "Organize this
   // evaluation" at the bottom of the page). null = not filed.
-  const [projectTarget, setProjectTarget] = useState<ProjectTarget | null>(initialProject ?? null);
+  const projectTarget = initialProject ?? null;
   // Bumped whenever a project is created or a session is moved/deleted, so the
   // Projects list above Past Sessions reloads.
   const [listRefresh, setListRefresh] = useState(0);
@@ -104,6 +92,29 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
   const [startDifficulty, setStartDifficulty] = useState<number>(1);
   const [maxDifficulty, setMaxDifficulty] = useState<number>(5);
   const [passThreshold, setPassThreshold] = useState<number>(6);
+
+  useEffect(() => {
+    if (!initialProject) return;
+    resolveProjectConfig(initialProject.id).then((cfg) => {
+      if (!cfg) return;
+      if (cfg.connectionMode) setConnectionMode(cfg.connectionMode);
+      if (cfg.http) setConnection((prev) => ({ ...prev, ...cfg.http }));
+      if (cfg.socketio) setSocketioConnection((prev) => ({ ...prev, ...cfg.socketio }));
+      if (cfg.swagger) setSwaggerConnection((prev) => ({ ...prev, ...cfg.swagger }));
+      if (cfg.browser) setBrowserConnection((prev) => ({ ...prev, ...cfg.browser }));
+      
+      if (typeof cfg.maxRounds === "number") setMaxRounds(cfg.maxRounds);
+      if (typeof cfg.capabilityOverride === "string") setCapabilityOverride(cfg.capabilityOverride);
+      if (Array.isArray(cfg.categories)) setSelectedCategories(cfg.categories);
+      if (typeof cfg.startDifficulty === "number") setStartDifficulty(cfg.startDifficulty);
+      if (typeof cfg.maxDifficulty === "number") setMaxDifficulty(cfg.maxDifficulty);
+      if (typeof cfg.passThreshold === "number") setPassThreshold(cfg.passThreshold);
+      if (typeof cfg.userDescription === "string") {
+        setUserDescription(cfg.userDescription);
+        if (cfg.userDescription) setShowUserDescription(true);
+      }
+    });
+  }, [initialProject]);
 
   function toggleCategory(cat: string) {
     setSelectedCategories((prev) =>
@@ -120,20 +131,6 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
     value: SocketIOConnectionRequest[K],
   ) {
     setSocketioConnection((prev) => ({ ...prev, [key]: value }));
-  }
-
-  function updateDirectHttpConnection<K extends keyof CustomEndpointConnectionRequest>(
-    key: K,
-    value: CustomEndpointConnectionRequest[K],
-  ) {
-    setDirectHttpConnection((prev) => ({ ...prev, [key]: value }));
-  }
-
-  function updatePublicApiConnection<K extends keyof PublicAPIConnectionRequest>(
-    key: K,
-    value: PublicAPIConnectionRequest[K],
-  ) {
-    setPublicApiConnection((prev) => ({ ...prev, [key]: value }));
   }
 
   function updateSwaggerConnection<K extends keyof SwaggerConnectionRequest>(
@@ -172,26 +169,6 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
         }
       }
       activeConnection = connection;
-    } else if (connectionMode === "direct_http") {
-      if (!directHttpConnection.chat_endpoint_url.trim()) {
-        setFormError("Chat endpoint URL is required.");
-        return;
-      }
-      if (!directHttpConnection.task_field.trim()) {
-        setFormError("Task field name is required.");
-        return;
-      }
-      activeConnection = directHttpConnection;
-    } else if (connectionMode === "public_api") {
-      if (!publicApiConnection.system_prompt.trim()) {
-        setFormError("System prompt is required.");
-        return;
-      }
-      if (!publicApiConnection.model.trim()) {
-        setFormError("Model is required.");
-        return;
-      }
-      activeConnection = publicApiConnection;
     } else if (connectionMode === "swagger") {
       if (!swaggerConnection.chat_endpoint_url.trim()) {
         setFormError("Chat endpoint URL is required.");
@@ -258,6 +235,24 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
       agent_brief: userDescription.trim() ? userDescription.trim() : null,
       project_id: projectTarget ? projectTarget.id : null,
     };
+
+    if (projectTarget) {
+      saveProjectConfig(projectTarget.id, {
+        connectionMode: connectionMode as "http" | "socketio" | "swagger" | "browser",
+        http: connectionMode === "http" ? connection : undefined,
+        socketio: connectionMode === "socketio" ? socketioConnection : undefined,
+        swagger: connectionMode === "swagger" ? swaggerConnection : undefined,
+        browser: connectionMode === "browser" ? browserConnection : undefined,
+        maxRounds,
+        capabilityOverride: capabilityOverride.trim() || undefined,
+        categories: selectedCategories,
+        startDifficulty,
+        maxDifficulty,
+        passThreshold,
+        userDescription: userDescription.trim() || undefined,
+      });
+    }
+
     onStart(request);
   }
 
@@ -267,7 +262,8 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
   // the two places it is rendered below). It is also what the report shows as the
   // agent's Description.
   const describeChatbotField = (
-    <div className="rounded-md border border-slate-800 bg-slate-900/30 p-4">
+    <div className="rounded-lg border border-slate-800 bg-slate-950/40 p-4">
+      <p className={`${SECTION_LABEL} em-sec--ctx mb-3`}>Agent context</p>
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span className="text-lg">💬</span>
@@ -321,24 +317,25 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
     </div>
   );
 
-  function handleLoadReport() {
-    const trimmed = reloadSessionId.trim();
-    if (trimmed) onLoadReport(trimmed);
-  }
-
   return (
-    <div className="mx-auto flex w-full max-w-[850px] flex-col gap-10">
+    <div className="mx-auto flex w-full max-w-[1450px] flex-col gap-8">
       <form onSubmit={handleSubmit} className="flex w-full flex-col gap-6">
-        <div>
-          <h1 className="text-2xl font-semibold text-slate-50">New Evaluation Session</h1>
-          <p className="mt-1 text-sm text-slate-400">
-            Point EvalMind at an Agent Under Test and start a live evaluation.
+        <header className="border-b border-slate-800 pb-6">
+          <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-indigo-400">
+            EvalMind — AI Evaluation Workspace
           </p>
-        </div>
+          <h1 className="mt-2 text-3xl font-semibold uppercase tracking-tight text-slate-50 sm:text-4xl">
+            New Evaluation
+          </h1>
+          <p className="mt-2 text-base text-slate-400">Configure an AI agent and start an evaluation.</p>
+        </header>
 
-        <div className="flex flex-col gap-2">
-          <span className="text-sm font-medium text-slate-200">Connection type</span>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+        {/* Dashboard grid: connection (left) | evaluation settings (right) on wide screens */}
+        <div className="grid grid-cols-1 items-start gap-6 xl:grid-cols-[minmax(0,1fr)_400px]">
+        <div className="flex min-w-0 flex-col gap-6">
+        <div className="flex flex-col gap-3 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
+          <span className={`${SECTION_LABEL} em-sec--conn`}>Connection type</span>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4 [&>button]:py-3 [&>button]:text-center">
             <button
               type="button"
               onClick={() => setConnectionMode("http")}
@@ -392,6 +389,21 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
           </div>
         </div>
 
+        <div className="flex flex-col gap-6 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
+          <span className={`${SECTION_LABEL} ${connectionMode === "browser" ? "em-sec--browser" : "em-sec--cfg"}`}>
+            {connectionMode === "browser" ? "Browser automation" : "Connection configuration"}
+          </span>
+          <span className="rounded-full border border-slate-700 bg-slate-800/60 px-2.5 py-0.5 font-mono text-[11px] text-slate-300">
+            {connectionMode === "http"
+              ? "HTTP / REST"
+              : connectionMode === "socketio"
+                ? "Socket.IO (JWT)"
+                : connectionMode === "swagger"
+                  ? "Swagger / OpenAPI"
+                  : "Browser (Playwright)"}
+          </span>
+        </div>
         {connectionMode === "http" && (
           <>
             <div className="flex flex-col gap-2">
@@ -739,7 +751,7 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
                   />
                 </div>
 
-                <div className="grid grid-cols-3 gap-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
                   <div className="flex flex-col gap-2">
                     <label htmlFor="browser_username_sel" className="text-sm font-medium text-slate-200">
                       Username selector <span className="text-slate-500">(optional)</span>
@@ -1017,6 +1029,14 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
         )}
 
         {connectionMode !== "http" && describeChatbotField}
+        </div>
+        </div>
+
+        <aside className="flex min-w-0 flex-col gap-6">
+        <div className="flex flex-col gap-6 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
+        <div className="border-b border-slate-800 pb-3">
+          <span className={`${SECTION_LABEL} em-sec--set`}>Evaluation settings</span>
+        </div>
 
         <div className="flex flex-col gap-2">
           <label htmlFor="max_rounds" className="text-sm font-medium text-slate-200">
@@ -1182,6 +1202,10 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
           </div>
         )}
 
+        </div>
+        </aside>
+        </div>
+
         {formError && (
           <div className="rounded-md border border-red-800 bg-red-950/50 px-3 py-2 text-sm text-red-300">
             {formError}
@@ -1191,77 +1215,28 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
         <button
           type="submit"
           disabled={disabled}
-          className="rounded-md bg-indigo-600 px-4 py-2 font-medium text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
+          className="em-cta rounded-xl bg-indigo-600 px-6 py-4 text-base font-semibold tracking-wide text-white shadow-lg shadow-indigo-950/50 transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400 disabled:shadow-none"
         >
           {disabled ? "Starting…" : "Start Evaluation"}
         </button>
 
         {projectTarget && (
           <p className="-mt-3 text-xs text-slate-500">
-            Will be saved to project <span className="text-slate-300">{projectTarget.name}</span>.{" "}
-            <button
-              type="button"
-              onClick={() => setProjectTarget(null)}
-              className="text-indigo-400 hover:text-indigo-300"
-            >
-              Remove
-            </button>
+            Will be saved to project <span className="text-slate-300">{projectTarget.name}</span>.
           </p>
         )}
       </form>
 
-      <div className="flex flex-col gap-2 border-t border-slate-800 pt-6">
-        <label htmlFor="reload_session_id" className="text-sm font-medium text-slate-200">
-          Already ran a session? View its report
-        </label>
-        <div className="flex gap-2">
-          <input
-            id="reload_session_id"
-            type="text"
-            placeholder="session_id"
-            value={reloadSessionId}
-            onChange={(e) => setReloadSessionId(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                handleLoadReport();
-              }
-            }}
-            className="flex-1 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-          />
-          <button
-            type="button"
-            onClick={handleLoadReport}
-            className="rounded-md border border-slate-700 px-4 py-2 text-sm text-slate-300 hover:bg-slate-800"
-          >
-            View report
-          </button>
-        </div>
-        <p className="text-xs text-slate-500">
-          Or open a link with <code className="text-slate-400">?session_id=...</code> in the URL directly.
-        </p>
+      <div className="flex flex-col gap-4 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
+        <h2 className={`${SECTION_LABEL} em-sec--hist`}>Past Sessions in this Project</h2>
+        <SessionHistoryPanel onViewReport={onLoadReport} onChanged={bumpLists} refreshKey={listRefresh} projectId={projectTarget?.id} />
       </div>
-
-      {/* Projects */}
-      <div className="flex flex-col gap-3 border-t border-slate-800 pt-6">
-        <h2 className="text-sm font-medium text-slate-200">Projects</h2>
-        <ProjectsPanel onViewReport={onLoadReport} refreshKey={listRefresh} onChanged={bumpLists} />
-      </div>
-
-      {/* Session history */}
-      <div className="flex flex-col gap-3 border-t border-slate-800 pt-6">
-        <h2 className="text-sm font-medium text-slate-200">Past Sessions</h2>
-        <SessionHistoryPanel onViewReport={onLoadReport} onChanged={bumpLists} refreshKey={listRefresh} />
-      </div>
-
-      <OrganizeSessionPanel
-        target={projectTarget}
-        onTargetChange={setProjectTarget}
-        onProjectCreated={bumpLists}
-      />
     </div>
   );
 }
+
+/** Shared eyebrow style for the dashboard section headings (presentation only). */
+const SECTION_LABEL = "em-sec font-mono text-[11px] uppercase tracking-[0.2em] text-slate-400";
 
 /** Mirrors the backend's max_length on SessionStartRequest.agent_brief. */
 const DESCRIPTION_MAX = 2000;

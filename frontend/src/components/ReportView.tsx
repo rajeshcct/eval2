@@ -111,7 +111,7 @@ function RoundHistoryRow({ round, forcedOpen }: { round: RoundHistoryEntry; forc
       </button>
 
       {isOpen && (
-        <div className="flex flex-col gap-2 bg-slate-950/50 px-3 py-2 text-xs text-slate-400 print:bg-slate-50 print:text-slate-600">
+        <div className="flex flex-col gap-3 bg-slate-950/50 px-4 py-3 text-sm text-slate-400 print:bg-slate-50 print:text-slate-600">
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
             <span>accuracy: {formatScore(round.accuracy)}</span>
             <span>relevance: {formatScore(round.relevance)}</span>
@@ -119,7 +119,7 @@ function RoundHistoryRow({ round, forcedOpen }: { round: RoundHistoryEntry; forc
             <span>safety: {formatScore(round.safety)}</span>
           </div>
           {round.reasoning && (
-            <div className="max-w-4xl">
+            <div className="rounded-md border border-slate-800 bg-slate-900/40 p-3 print:border-slate-200 print:bg-white">
               <span className="font-medium text-slate-300 print:text-slate-800">Judge reasoning: </span>
               {round.reasoning}
             </div>
@@ -129,18 +129,20 @@ function RoundHistoryRow({ round, forcedOpen }: { round: RoundHistoryEntry; forc
             <span>tokens: {round.tokens_used !== null ? round.tokens_used : "—"}</span>
             <span>cost: {round.estimated_cost !== null ? formatCost(round.estimated_cost) : "—"}</span>
           </div>
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2 lg:[&>*:only-child]:col-span-2">
           {round.task && (
-            <div className="max-w-4xl">
+            <div className="whitespace-pre-wrap break-words rounded-md border border-slate-800 bg-slate-900/40 p-3 print:border-slate-200 print:bg-white">
               <span className="font-medium text-slate-300 print:text-slate-800">Task: </span>
               {round.task}
             </div>
           )}
           {round.output && (
-            <div className="max-w-4xl">
+            <div className="whitespace-pre-wrap break-words rounded-md border border-slate-800 bg-slate-900/40 p-3 print:border-slate-200 print:bg-white">
               <span className="font-medium text-slate-300 print:text-slate-800">Output: </span>
               {round.output}
             </div>
           )}
+          </div>
         </div>
       )}
     </div>

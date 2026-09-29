@@ -10,6 +10,8 @@ interface SessionHistoryPanelProps {
   onChanged?: () => void;
   /** Bump this number to make the list reload (e.g. after a delete elsewhere). */
   refreshKey?: number;
+  /** Filter sessions by project ID */
+  projectId?: string;
 }
 
 /** How many rows show before "View all sessions →" reveals the rest. */
@@ -28,7 +30,7 @@ function sessionsLabel(count: number): string {
   return `${count} ${count === 1 ? "session" : "sessions"}`;
 }
 
-export default function SessionHistoryPanel({ onViewReport, onChanged, refreshKey }: SessionHistoryPanelProps) {
+export default function SessionHistoryPanel({ onViewReport, onChanged, refreshKey, projectId }: SessionHistoryPanelProps) {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -50,7 +52,7 @@ export default function SessionHistoryPanel({ onViewReport, onChanged, refreshKe
     if (!silent) setLoading(true);
     setError(null);
     try {
-      const data = await fetchSessions(50);
+      const data = await fetchSessions(50, projectId);
       setSessions(data);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -159,7 +161,7 @@ export default function SessionHistoryPanel({ onViewReport, onChanged, refreshKe
   const hasMore = sessions.length > INITIAL_VISIBLE;
 
   return (
-    <div className="flex flex-col gap-1">
+    <div className="flex flex-col gap-2">
       {visible.map((session) => {
         // Prefer the agent's display name; older sessions have none, so fall
         // back to the (truncated) capability description as before.
@@ -169,7 +171,7 @@ export default function SessionHistoryPanel({ onViewReport, onChanged, refreshKe
         return (
           <div
             key={session.id}
-            className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 rounded-md border border-slate-800 bg-slate-900/30 px-3 py-2"
+            className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-lg border border-slate-800 bg-slate-950/40 px-4 py-3 transition-colors hover:border-slate-700"
           >
             <div className="min-w-0 flex-1 basis-40">
               <p className="truncate text-sm font-medium text-slate-200" title={session.aut_description}>
@@ -186,7 +188,7 @@ export default function SessionHistoryPanel({ onViewReport, onChanged, refreshKe
                 <button
                   type="button"
                   onClick={() => onViewReport(session.id)}
-                  className="rounded border border-indigo-800 px-2 py-0.5 text-xs text-indigo-300 hover:bg-indigo-950"
+                  className="rounded-md border border-indigo-800 px-2.5 py-1 text-xs text-indigo-300 hover:bg-indigo-950"
                 >
                   View Report
                 </button>
@@ -200,7 +202,7 @@ export default function SessionHistoryPanel({ onViewReport, onChanged, refreshKe
                 type="button"
                 onClick={() => (isAssigning ? closeAssign() : openAssign(session))}
                 aria-expanded={isAssigning}
-                className="rounded border border-slate-700 px-2 py-0.5 text-xs text-slate-300 hover:bg-slate-800"
+                className="rounded-md border border-slate-700 px-2.5 py-1 text-xs text-slate-300 hover:bg-slate-800"
               >
                 {session.project_id ? "Change project" : "Add to project"}
               </button>
@@ -209,7 +211,7 @@ export default function SessionHistoryPanel({ onViewReport, onChanged, refreshKe
                 type="button"
                 onClick={() => void handleDelete(session.id)}
                 disabled={deletingId === session.id}
-                className="rounded border border-red-900 px-2 py-0.5 text-xs text-red-400 hover:bg-red-950/60 disabled:opacity-50"
+                className="rounded-md border border-red-900 px-2.5 py-1 text-xs text-red-400 hover:bg-red-950/60 disabled:opacity-50"
               >
                 {deletingId === session.id ? "…" : "Delete"}
               </button>

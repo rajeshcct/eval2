@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import NewSessionForm from "./components/NewSessionForm";
+import ProjectHub from "./components/ProjectHub";
 import LiveRunView from "./components/LiveRunView";
 import ReportView from "./components/ReportView";
 import { fetchSessionReport, startRun, sendWsMessage } from "./lib/ws";
 import type { FinalReport, ProgressEvent, DescriptionComparisonResult } from "./lib/ws";
-import type { SessionStartRequest } from "./lib/types";
-import type { ProjectTarget } from "./components/OrganizeSessionPanel";
-
+import type { SessionStartRequest, ProjectTarget } from "./lib/types";
 /**
  * App shell with three states (form -> live -> report), held in React
  * state. Phase III built the form + WS client (with every event logged to
@@ -240,8 +239,8 @@ export default function App() {
 
   return (
     <div className="min-h-screen px-4 py-12 sm:px-[4vw] print:px-4">
-      {state === "form" && (
-        <div className="mx-auto flex w-full max-w-[1450px] flex-col gap-4">
+      {state === "form" && !presetProject && (
+        <div className="em-landing mx-auto flex w-full max-w-[1450px] flex-col gap-4">
           {socketError && (
             <div
               role="alert"
@@ -250,6 +249,46 @@ export default function App() {
               {socketError}
             </div>
           )}
+          <header className="border-b border-slate-800 pb-6">
+            <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-indigo-400">
+              EvalMind — AI Evaluation Workspace
+            </p>
+            <h1 className="mt-2 text-3xl font-semibold uppercase tracking-tight text-slate-50 sm:text-4xl">
+              New Evaluation
+            </h1>
+            <p className="mt-2 text-base text-slate-400">Configure an AI agent and start an evaluation.</p>
+          </header>
+          <ProjectHub onOpenProject={setPresetProject} />
+        </div>
+      )}
+
+      {state === "form" && presetProject && (
+        <div className="em-landing mx-auto flex w-full max-w-[1450px] flex-col gap-4">
+          {socketError && (
+            <div
+              role="alert"
+              className="rounded-md border border-red-800 bg-red-950/50 px-3 py-2 text-sm text-red-300"
+            >
+              {socketError}
+            </div>
+          )}
+          <header className="border-b border-slate-800 pb-6 flex justify-between items-center">
+            <div>
+              <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-indigo-400">
+                EvalMind — AI Evaluation Workspace
+              </p>
+              <h1 className="mt-2 text-3xl font-semibold uppercase tracking-tight text-slate-50 sm:text-4xl">
+                {presetProject.name}
+              </h1>
+              <p className="mt-2 text-base text-slate-400">Run an evaluation for this project.</p>
+            </div>
+            <button
+              onClick={() => setPresetProject(null)}
+              className="rounded-md border border-slate-700 px-4 py-2 text-sm text-slate-300 hover:bg-slate-800"
+            >
+              Change Project
+            </button>
+          </header>
           <NewSessionForm
             onStart={handleStart}
             onLoadReport={loadReportById}

@@ -48,12 +48,35 @@ export default function LiveRunView({ events, socketError, disconnected, onRetry
   const live = useMemo(() => deriveLiveState(events), [events]);
 
   return (
-    <div className="mx-auto flex w-full max-w-3xl flex-col gap-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold text-slate-50">Evaluation running…</h1>
+    <div className="relative isolate mx-auto flex w-full max-w-[1450px] flex-col gap-6">
+      {/* decorative glow behind the header (presentation only) */}
+      <div
+        aria-hidden
+        className="pointer-events-none absolute -top-16 left-1/2 -z-10 h-72 w-2/3 -translate-x-1/2 rounded-full bg-gradient-to-r from-indigo-600/20 via-fuchsia-600/15 to-sky-600/20 blur-3xl"
+      />
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="relative flex h-2.5 w-2.5" aria-hidden>
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+              <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-emerald-400" />
+            </span>
+            <span className="font-mono text-[11px] uppercase tracking-[0.3em] text-emerald-400">Live</span>
+            <span className="font-mono text-[11px] uppercase tracking-[0.3em] text-slate-500">
+              EvalMind — Agent under test
+            </span>
+          </div>
+          <h1 className="mt-2 bg-gradient-to-r from-slate-50 via-indigo-200 to-fuchsia-200 bg-clip-text text-3xl font-semibold tracking-tight text-transparent sm:text-4xl">
+            Evaluation running…
+          </h1>
+          <p className="mt-2 text-base text-slate-400">
+            Your agent is being tested for functionality, security and compliance. Results stream in round by
+            round.
+          </p>
+        </div>
         <button
           onClick={onCancel}
-          className="rounded-md border border-slate-700 px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-800"
+          className="rounded-lg border border-slate-700 bg-slate-900/60 px-4 py-2 text-sm font-medium text-slate-300 transition-colors hover:border-slate-600 hover:bg-slate-800"
         >
           Cancel / back to form
         </button>
@@ -61,7 +84,7 @@ export default function LiveRunView({ events, socketError, disconnected, onRetry
 
       {/* Mismatch confirmation modal */}
       {mismatchData && (
-        <div className="rounded-lg border-2 border-amber-500/60 bg-gradient-to-b from-amber-950/50 to-slate-900/90 p-5 shadow-lg shadow-amber-900/20">
+        <div className="mx-auto w-full max-w-4xl rounded-lg border-2 border-amber-500/60 bg-gradient-to-b from-amber-950/50 to-slate-900/90 p-5 shadow-lg shadow-amber-900/20">
           <div className="mb-4 flex items-center gap-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-full bg-amber-600/20 text-xl">
               ⚠️
@@ -146,7 +169,7 @@ export default function LiveRunView({ events, socketError, disconnected, onRetry
 
       <DescriberSection started={live.describerStarted} result={live.describer} />
 
-      <div className="flex flex-col gap-4">
+      <div className="grid grid-cols-1 items-start gap-5 xl:grid-cols-3">
         {CATEGORY_ORDER.map((category) => (
           <CategoryCard key={category} state={live.categories[category]} label={LABELS[category]} />
         ))}

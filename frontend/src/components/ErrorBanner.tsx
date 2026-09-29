@@ -17,9 +17,14 @@ export default function ErrorBanner({ errors }: ErrorBannerProps) {
         <div
           key={i}
           role="alert"
-          className="rounded-md border border-red-800 bg-red-950/50 px-3 py-2 text-sm text-red-300"
+          className="flex items-start gap-3 rounded-xl border border-red-500/40 border-l-4 border-l-red-500 bg-red-500/10 px-4 py-3 text-sm text-red-300"
         >
-          <span className="font-medium text-red-200">{e.stage}:</span> {e.message}
+          <span aria-hidden className="text-base leading-5">
+            ⛔
+          </span>
+          <p>
+            <span className="font-semibold text-red-200">{e.stage}:</span> {e.message}
+          </p>
         </div>
       ))}
     </div>

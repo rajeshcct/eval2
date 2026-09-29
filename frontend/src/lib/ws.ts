@@ -304,8 +304,10 @@ export interface SessionSummary {
 }
 
 /** GET /api/sessions \u2014 list recent sessions, newest first. */
-export async function fetchSessions(limit = 50): Promise<SessionSummary[]> {
-  const res = await fetch(`${BACKEND_HTTP_URL}/api/sessions?limit=${limit}`);
+export async function fetchSessions(limit = 50, projectId?: string | null): Promise<SessionSummary[]> {
+  const qs = new URLSearchParams({ limit: String(limit) });
+  if (projectId) qs.set("project_id", projectId);
+  const res = await fetch(`${BACKEND_HTTP_URL}/api/sessions?${qs.toString()}`);
   if (!res.ok) throw new Error(`GET /api/sessions failed: HTTP ${res.status}`);
   return (await res.json()) as SessionSummary[];
 }

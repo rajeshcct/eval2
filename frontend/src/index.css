@@ -2,8 +2,562 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Rich, non-flat dark canvas: deep navy with faint violet / cyan / indigo
+ * radial light pools. Fixed so the glow stays put while content scrolls.
+ * (Print resets this to white further down.) */
 body {
-  @apply bg-slate-950 text-slate-100 antialiased;
+  @apply text-slate-100 antialiased;
+  background-color: #060918;
+  background-image:
+    radial-gradient(1100px 620px at 8% -8%, rgb(139 92 246 / 0.17), transparent 62%),
+    radial-gradient(900px 520px at 96% 4%, rgb(34 211 238 / 0.09), transparent 62%),
+    radial-gradient(1200px 760px at 50% 108%, rgb(79 70 229 / 0.15), transparent 65%),
+    linear-gradient(180deg, #080d24 0%, #060918 48%, #0a0819 100%);
+  background-attachment: fixed;
+  background-repeat: no-repeat;
+}
+
+/* =====================================================================
+ * EvalMind — landing-page visual polish (presentation only)
+ *
+ * Everything below is scoped to `.em-landing` (the wrapper App.tsx puts
+ * around the New Evaluation page) and targets the existing Tailwind class
+ * tokens via attribute selectors, so no layout, state, handler or field
+ * was touched. Palette:
+ *   violet 139 92 246 · indigo 99 102 241 · blue 59 130 246
+ *   cyan 34 211 238 · emerald 52 211 153 · amber 251 191 36 · coral 251 113 133
+ * ===================================================================== */
+
+.em-landing {
+  color-scheme: dark;
+  scrollbar-width: thin;
+  scrollbar-color: rgb(99 102 241 / 0.5) transparent;
+}
+
+/* ---------- Page header: title glow, eyebrow, gradient divider ---------- */
+
+.em-landing header h1 {
+  background: linear-gradient(92deg, #ffffff 0%, #e5e7ff 45%, #c4b5fd 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  filter: drop-shadow(0 0 22px rgb(139 92 246 / 0.45));
+}
+
+.em-landing header > p[class~="font-mono"] {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.65rem;
+  color: #a5b4fc;
+}
+.em-landing header > p[class~="font-mono"]::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: linear-gradient(135deg, #a78bfa, #22d3ee);
+  box-shadow: 0 0 10px rgb(34 211 238 / 0.75);
+}
+
+/* Any existing "border-b border-slate-800" rule (page header + card headers)
+ * becomes a thin violet -> cyan -> transparent gradient line. */
+.em-landing [class~="border-b"][class~="border-slate-800"] {
+  border-bottom-color: transparent;
+  background-image: linear-gradient(90deg, rgb(139 92 246 / 0.6), rgb(34 211 238 / 0.3) 42%, transparent 88%);
+  background-size: 100% 1px;
+  background-repeat: no-repeat;
+  background-position: bottom;
+  background-origin: border-box;
+}
+.em-landing [class~="border-t"][class~="border-slate-800"] {
+  border-top-color: rgb(129 140 248 / 0.2);
+}
+
+/* ---------- Cards: gradient border, soft shadow, inner highlight ---------- */
+
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"] {
+  --em-fill: linear-gradient(165deg, #10173a 0%, #0b1030 100%);
+  --em-tint: rgb(99 102 241 / 0.1);
+  --em-b1: rgb(139 92 246 / 0.34);
+  --em-b2: rgb(99 102 241 / 0.14);
+  --em-b3: rgb(34 211 238 / 0.2);
+  --em-glow: rgb(99 102 241 / 0.22);
+  --em-glow-h: rgb(139 92 246 / 0.4);
+  --em-line: rgb(139 92 246 / 0.9);
+
+  position: relative;
+  isolation: isolate;
+  border-color: transparent;
+  background:
+    radial-gradient(560px 220px at 0% 0%, var(--em-tint), transparent 70%) padding-box,
+    var(--em-fill) padding-box,
+    linear-gradient(135deg, var(--em-b1), var(--em-b2) 45%, var(--em-b3)) border-box;
+  box-shadow:
+    0 12px 34px -16px rgb(2 6 23 / 0.85),
+    0 0 40px -20px var(--em-glow),
+    inset 0 1px 0 rgb(255 255 255 / 0.05);
+  transition: box-shadow 0.22s ease, filter 0.22s ease;
+}
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]:hover {
+  --em-b1: rgb(167 139 250 / 0.62);
+  --em-b2: rgb(99 102 241 / 0.3);
+  --em-b3: rgb(34 211 238 / 0.42);
+  box-shadow:
+    0 16px 42px -16px rgb(2 6 23 / 0.9),
+    0 0 46px -14px var(--em-glow-h),
+    inset 0 1px 0 rgb(255 255 255 / 0.07);
+}
+/* Faint corner highlight (sits under the content) */
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(260px 130px at 100% 0%, rgb(34 211 238 / 0.07), transparent 70%);
+}
+/* Slim accent bar along the top edge */
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]::after {
+  content: "";
+  position: absolute;
+  top: -1px;
+  left: 1.5rem;
+  right: 1.5rem;
+  height: 2px;
+  border-radius: 2px;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, var(--em-line), rgb(34 211 238 / 0.75), transparent);
+  opacity: 0.5;
+}
+
+/* Hierarchy — 2: connection cards (blue / cyan glow, strongest) */
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]:has(> .em-sec--conn),
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]:has(.em-sec--cfg),
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]:has(.em-sec--browser) {
+  --em-fill: linear-gradient(165deg, #0f1a46 0%, #0a1236 100%);
+  --em-tint: rgb(59 130 246 / 0.13);
+  --em-b1: rgb(99 102 241 / 0.5);
+  --em-b2: rgb(59 130 246 / 0.2);
+  --em-b3: rgb(34 211 238 / 0.45);
+  --em-glow: rgb(34 211 238 / 0.24);
+  --em-glow-h: rgb(34 211 238 / 0.4);
+  --em-line: rgb(99 102 241 / 0.95);
+}
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]:has(> .em-sec--conn)::after,
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]:has(.em-sec--cfg)::after,
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]:has(.em-sec--browser)::after,
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]:has(.em-sec--set)::after {
+  opacity: 0.95;
+}
+
+/* Hierarchy — 3: evaluation settings (violet) */
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]:has(.em-sec--set) {
+  --em-fill: linear-gradient(165deg, #171442 0%, #0d1033 100%);
+  --em-tint: rgb(139 92 246 / 0.14);
+  --em-b1: rgb(167 139 250 / 0.55);
+  --em-b2: rgb(99 102 241 / 0.2);
+  --em-b3: rgb(139 92 246 / 0.32);
+  --em-glow: rgb(139 92 246 / 0.3);
+  --em-glow-h: rgb(139 92 246 / 0.45);
+}
+
+/* Hierarchy — 5 & 6: quieter cards, each with its own faint hue */
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]:has(> .em-sec--proj) {
+  --em-fill: linear-gradient(165deg, #11163a 0%, #0a0f2c 100%);
+  --em-tint: rgb(251 191 36 / 0.055);
+  --em-b1: rgb(251 191 36 / 0.3);
+  --em-b2: rgb(99 102 241 / 0.13);
+  --em-b3: rgb(139 92 246 / 0.22);
+  --em-glow: rgb(251 191 36 / 0.1);
+  --em-glow-h: rgb(251 191 36 / 0.2);
+  --em-line: rgb(251 191 36 / 0.85);
+}
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]:has(> .em-sec--hist) {
+  --em-fill: linear-gradient(165deg, #0e1636 0%, #0a112e 100%);
+  --em-tint: rgb(56 189 248 / 0.06);
+  --em-b1: rgb(56 189 248 / 0.28);
+  --em-b2: rgb(99 102 241 / 0.12);
+  --em-b3: rgb(52 211 153 / 0.2);
+  --em-glow: rgb(56 189 248 / 0.1);
+  --em-glow-h: rgb(56 189 248 / 0.2);
+  --em-line: rgb(56 189 248 / 0.85);
+}
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]:has(.em-sec--org) {
+  --em-fill: linear-gradient(165deg, #141239 0%, #0c0f2d 100%);
+  --em-tint: rgb(232 121 249 / 0.06);
+  --em-b1: rgb(232 121 249 / 0.28);
+  --em-b2: rgb(99 102 241 / 0.14);
+  --em-b3: rgb(139 92 246 / 0.28);
+  --em-glow: rgb(232 121 249 / 0.1);
+  --em-glow-h: rgb(232 121 249 / 0.2);
+  --em-line: rgb(232 121 249 / 0.8);
+}
+
+/* ---------- Section headers: small colour-coded icon tile ---------- */
+
+.em-landing .em-sec {
+  --ac: 167 139 250;
+  display: flex;
+  width: fit-content;
+  align-items: center;
+  gap: 0.6rem;
+  color: #cbd5ff;
+  font-weight: 600;
+}
+.em-landing .em-sec::before {
+  content: "\2726";
+  display: inline-grid;
+  place-items: center;
+  width: 1.4rem;
+  height: 1.4rem;
+  flex: none;
+  border-radius: 0.45rem;
+  font-size: 0.72rem;
+  line-height: 1;
+  letter-spacing: 0;
+  color: rgb(var(--ac));
+  background: rgb(var(--ac) / 0.14);
+  box-shadow: inset 0 0 0 1px rgb(var(--ac) / 0.38), 0 0 14px -2px rgb(var(--ac) / 0.5);
+}
+.em-landing .em-sec--conn { --ac: 167 139 250; }
+.em-landing .em-sec--cfg { --ac: 96 165 250; }
+.em-landing .em-sec--cfg::before { content: "\2756"; }
+.em-landing .em-sec--browser { --ac: 52 211 153; }
+.em-landing .em-sec--browser::before { content: "\25CE"; }
+.em-landing .em-sec--ctx { --ac: 34 211 238; }
+.em-landing .em-sec--ctx::before { content: "\25C8"; }
+.em-landing .em-sec--set { --ac: 129 140 248; }
+.em-landing .em-sec--set::before { content: "\2699\FE0E"; }
+.em-landing .em-sec--proj { --ac: 251 191 36; }
+.em-landing .em-sec--proj::before { content: "\25A3"; }
+.em-landing .em-sec--hist { --ac: 56 189 248; }
+.em-landing .em-sec--hist::before { content: "\25C9"; }
+.em-landing .em-sec--org { --ac: 232 121 249; }
+.em-landing .em-sec--org::before { content: "\25C7"; }
+
+/* ---------- Nested panels / rows ---------- */
+
+/* Toggle rows and inner option panels */
+.em-landing div[class~="bg-slate-900/50"],
+.em-landing [class~="bg-slate-900/30"] {
+  background: linear-gradient(180deg, rgb(20 27 66 / 0.55), rgb(12 17 44 / 0.55));
+  border-color: rgb(129 140 248 / 0.16);
+}
+
+/* Inset panels & list rows (describe-chatbot, project rows, session rows) */
+.em-landing [class~="bg-slate-950/40"] {
+  background: linear-gradient(180deg, rgb(21 29 70 / 0.55), rgb(10 14 38 / 0.6));
+  border-color: rgb(129 140 248 / 0.16);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease, background 0.2s ease;
+}
+.em-landing [class~="bg-slate-950/40"]:has(> .em-sec--ctx) {
+  border-color: rgb(34 211 238 / 0.28);
+  background:
+    radial-gradient(360px 120px at 0% 0%, rgb(34 211 238 / 0.09), transparent 70%),
+    linear-gradient(180deg, rgb(15 26 66 / 0.6), rgb(9 14 38 / 0.65));
+}
+/* Clickable rows: accent bar + lift + glow */
+.em-landing [class~="hover:border-slate-700"] {
+  box-shadow: inset 2px 0 0 rgb(139 92 246 / 0.55);
+}
+.em-landing [class~="hover:border-slate-700"]:hover {
+  border-color: rgb(167 139 250 / 0.5);
+  background: linear-gradient(180deg, rgb(30 40 96 / 0.62), rgb(14 20 52 / 0.66));
+  box-shadow:
+    inset 2px 0 0 rgb(34 211 238 / 0.85),
+    0 10px 28px -14px rgb(99 102 241 / 0.65),
+    0 0 0 1px rgb(139 92 246 / 0.08);
+  transform: translateY(-1px);
+}
+.em-landing button[class~="hover:bg-slate-800/40"] {
+  border-radius: 0.5rem;
+  transition: background-color 0.2s ease;
+}
+.em-landing button[class~="hover:bg-slate-800/40"]:hover {
+  background-color: rgb(99 102 241 / 0.1);
+}
+
+/* ---------- Inputs ---------- */
+
+.em-landing input:not([type="checkbox"]):not([type="radio"]),
+.em-landing textarea,
+.em-landing select {
+  background: linear-gradient(180deg, #0b1233, #0a0f2b);
+  border-color: rgb(129 140 200 / 0.24);
+  color: #ffffff;
+  box-shadow: inset 0 1px 2px rgb(2 6 23 / 0.5);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+.em-landing input:not([type="checkbox"]):not([type="radio"])::placeholder,
+.em-landing textarea::placeholder {
+  color: #6b7699;
+  opacity: 1;
+}
+.em-landing input:not([type="checkbox"]):not([type="radio"]):hover,
+.em-landing textarea:hover,
+.em-landing select:hover {
+  border-color: rgb(165 180 252 / 0.45);
+}
+.em-landing input:not([type="checkbox"]):not([type="radio"]):focus,
+.em-landing textarea:focus,
+.em-landing select:focus {
+  border-color: rgb(167 139 250 / 0.85);
+  box-shadow:
+    0 0 0 3px rgb(139 92 246 / 0.16),
+    0 0 22px -4px rgb(34 211 238 / 0.35),
+    inset 0 1px 2px rgb(2 6 23 / 0.5);
+}
+.em-landing option {
+  background: #0b1130;
+  color: #ffffff;
+}
+.em-landing input[type="checkbox"] {
+  accent-color: #8b5cf6;
+  cursor: pointer;
+}
+
+/* Helper text: a touch brighter so it stays legible on the richer navy */
+.em-landing [class~="text-slate-500"] {
+  color: #7d89b3;
+}
+
+/* ---------- Buttons ---------- */
+
+/* Outline buttons (View report, Cancel, Change project, Hide/Enable, Skip…) */
+.em-landing button[class~="border-slate-700"] {
+  background: rgb(30 41 100 / 0.28);
+  border-color: rgb(129 140 248 / 0.28);
+  color: #cbd5f5;
+  transition: background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease, color 0.2s ease;
+}
+.em-landing button[class~="border-slate-700"]:hover:not(:disabled) {
+  background: rgb(99 102 241 / 0.16);
+  border-color: rgb(167 139 250 / 0.65);
+  box-shadow: 0 0 18px -5px rgb(139 92 246 / 0.5);
+  color: #ffffff;
+}
+
+/* Selectable cards / segmented buttons (connection type, project choices) */
+.em-landing button[aria-pressed],
+.em-landing button[role="radio"] {
+  border-color: transparent;
+  background:
+    linear-gradient(165deg, #111842, #0b1030) padding-box,
+    linear-gradient(135deg, rgb(129 140 248 / 0.28), rgb(148 163 184 / 0.12)) border-box;
+  color: #cbd5f5;
+  transition: box-shadow 0.2s ease, transform 0.2s ease, color 0.2s ease;
+}
+.em-landing button[aria-pressed]:hover,
+.em-landing button[role="radio"]:hover {
+  background:
+    linear-gradient(165deg, #141c4c, #0d1236) padding-box,
+    linear-gradient(135deg, rgb(167 139 250 / 0.7), rgb(34 211 238 / 0.45)) border-box;
+  box-shadow: 0 0 22px -6px rgb(139 92 246 / 0.5);
+  color: #ffffff;
+  transform: translateY(-1px);
+}
+.em-landing button[aria-pressed="true"],
+.em-landing button[aria-checked="true"],
+.em-landing button[aria-pressed="true"]:hover,
+.em-landing button[aria-checked="true"]:hover {
+  background:
+    linear-gradient(135deg, #251b5c, #16215f) padding-box,
+    linear-gradient(135deg, #a78bfa, #6366f1 55%, #22d3ee) border-box;
+  box-shadow: 0 0 0 1px rgb(139 92 246 / 0.12), 0 0 26px -6px rgb(139 92 246 / 0.6);
+  color: #e0e7ff;
+}
+/* Browser mode keeps its emerald identity when selected */
+.em-landing button[aria-pressed="true"][class~="border-emerald-500"],
+.em-landing button[aria-pressed="true"][class~="border-emerald-500"]:hover {
+  background:
+    linear-gradient(135deg, #0b2f30, #0c2247) padding-box,
+    linear-gradient(135deg, #34d399, #22d3ee) border-box;
+  box-shadow: 0 0 0 1px rgb(52 211 153 / 0.12), 0 0 26px -6px rgb(52 211 153 / 0.5);
+  color: #a7f3d0;
+}
+/* "Describe your chatbot" enabled state */
+.em-landing button[class~="border-cyan-500"] {
+  background: rgb(34 211 238 / 0.14);
+  border-color: rgb(34 211 238 / 0.65);
+  color: #a5f3fc;
+  box-shadow: 0 0 18px -6px rgb(34 211 238 / 0.55);
+}
+
+/* Secondary solid buttons (Save, Create project, Add session) */
+.em-landing button[class~="bg-indigo-600"]:not(:disabled) {
+  background-image: linear-gradient(115deg, #7c3aed, #4f6cf0 60%, #3b82f6);
+  border: 1px solid rgb(196 181 253 / 0.25);
+  color: #ffffff;
+  box-shadow: 0 6px 18px -8px rgb(124 58 237 / 0.65), inset 0 1px 0 rgb(255 255 255 / 0.22);
+  transition: filter 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+}
+.em-landing button[class~="bg-indigo-600"]:not(:disabled):hover {
+  filter: brightness(1.1);
+  box-shadow: 0 8px 24px -8px rgb(124 58 237 / 0.8), inset 0 1px 0 rgb(255 255 255 / 0.28);
+  transform: translateY(-1px);
+}
+
+/* Hierarchy — 4: the Start Evaluation button is the focal point */
+.em-landing .em-cta:not(:disabled) {
+  position: relative;
+  isolation: isolate;
+  background-image: linear-gradient(115deg, #7c3aed 0%, #6366f1 48%, #3b82f6 100%);
+  border: 1px solid rgb(196 181 253 / 0.35);
+  color: #ffffff;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-shadow: 0 1px 14px rgb(255 255 255 / 0.22);
+  box-shadow:
+    0 10px 34px -8px rgb(124 58 237 / 0.65),
+    0 0 60px -12px rgb(59 130 246 / 0.5),
+    0 0 0 1px rgb(99 102 241 / 0.25),
+    inset 0 1px 0 rgb(255 255 255 / 0.3),
+    inset 0 -12px 24px -14px rgb(30 27 75 / 0.55);
+  transition: transform 0.2s ease, box-shadow 0.2s ease, filter 0.2s ease;
+}
+.em-landing .em-cta:not(:disabled)::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 50% 0;
+  z-index: -1;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgb(255 255 255 / 0.16), transparent);
+}
+.em-landing .em-cta:not(:disabled):hover {
+  filter: brightness(1.1) saturate(1.05);
+  transform: translateY(-2px);
+  box-shadow:
+    0 16px 44px -8px rgb(124 58 237 / 0.8),
+    0 0 80px -10px rgb(59 130 246 / 0.65),
+    0 0 0 1px rgb(167 139 250 / 0.4),
+    inset 0 1px 0 rgb(255 255 255 / 0.36),
+    inset 0 -12px 24px -14px rgb(30 27 75 / 0.55);
+}
+.em-landing .em-cta:not(:disabled):active {
+  transform: translateY(0) scale(0.995);
+}
+.em-landing .em-cta:focus-visible {
+  outline: 2px solid rgb(34 211 238 / 0.75);
+  outline-offset: 3px;
+}
+
+/* View Report (indigo outline) */
+.em-landing button[class~="border-indigo-800"] {
+  background: rgb(99 102 241 / 0.1);
+  border-color: rgb(129 140 248 / 0.4);
+  color: #a5b4fc;
+  transition: background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease, color 0.2s ease;
+}
+.em-landing button[class~="border-indigo-800"]:hover {
+  background: rgb(99 102 241 / 0.2);
+  border-color: rgb(167 139 250 / 0.75);
+  box-shadow: 0 0 16px -4px rgb(139 92 246 / 0.6);
+  color: #ffffff;
+}
+
+/* Delete (coral outline) */
+.em-landing button[class~="border-red-900"] {
+  background: rgb(244 63 94 / 0.06);
+  border-color: rgb(251 113 133 / 0.35);
+  color: #fb7185;
+  transition: background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease, color 0.2s ease;
+}
+.em-landing button[class~="border-red-900"]:hover:not(:disabled) {
+  background: rgb(244 63 94 / 0.15);
+  border-color: rgb(251 113 133 / 0.75);
+  box-shadow: 0 0 16px -4px rgb(244 63 94 / 0.55);
+  color: #fecdd3;
+}
+
+/* Text links */
+.em-landing button[class~="text-indigo-400"] {
+  color: #a5b4fc;
+  transition: color 0.2s ease, text-shadow 0.2s ease;
+}
+.em-landing button[class~="text-indigo-400"]:hover {
+  color: #67e8f9;
+  text-shadow: 0 0 14px rgb(34 211 238 / 0.45);
+}
+
+/* ---------- Pills, dots ---------- */
+
+/* Connection-mode pill */
+.em-landing [class~="bg-slate-800/60"][class~="rounded-full"] {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  background: linear-gradient(135deg, rgb(139 92 246 / 0.2), rgb(34 211 238 / 0.1));
+  border-color: rgb(167 139 250 / 0.4);
+  color: #e0e7ff;
+}
+.em-landing [class~="bg-slate-800/60"][class~="rounded-full"]::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: #22d3ee;
+  box-shadow: 0 0 8px rgb(34 211 238 / 0.85);
+}
+/* "Optional" tag */
+.em-landing [class~="bg-slate-700/60"][class~="rounded-full"] {
+  background: rgb(34 211 238 / 0.1);
+  color: #67e8f9;
+  box-shadow: inset 0 0 0 1px rgb(34 211 238 / 0.25);
+}
+/* Project session-count pill */
+.em-landing span[class~="rounded-full"][class~="font-mono"][class~="bg-slate-900"] {
+  background: linear-gradient(135deg, rgb(139 92 246 / 0.18), rgb(59 130 246 / 0.12));
+  border-color: rgb(167 139 250 / 0.35);
+  color: #c4b5fd;
+}
+/* Loading dot */
+.em-landing [class~="animate-pulse"][class~="bg-slate-400"] {
+  background: #22d3ee;
+  box-shadow: 0 0 10px rgb(34 211 238 / 0.8);
+}
+
+/* ---------- Colour-coded callouts & states ---------- */
+
+/* Informational — violet (Swagger) */
+.em-landing [class~="bg-violet-950/40"] {
+  background: linear-gradient(135deg, rgb(139 92 246 / 0.16), rgb(99 102 241 / 0.05));
+  border-color: rgb(167 139 250 / 0.3);
+  border-left: 3px solid #a78bfa;
+}
+/* Informational — cyan ("How it works") */
+.em-landing [class~="bg-cyan-950/20"] {
+  background: linear-gradient(135deg, rgb(34 211 238 / 0.12), rgb(59 130 246 / 0.04));
+  border-color: rgb(34 211 238 / 0.28);
+  border-left: 3px solid #22d3ee;
+}
+/* Success / positive — emerald (Browser mode, login block, saved-to-project) */
+.em-landing [class~="bg-emerald-950/40"],
+.em-landing [class~="bg-emerald-950/20"] {
+  background: linear-gradient(135deg, rgb(52 211 153 / 0.14), rgb(34 211 238 / 0.04));
+  border-color: rgb(52 211 153 / 0.3);
+  border-left: 3px solid #34d399;
+}
+/* Error — coral */
+.em-landing [class~="bg-red-950/50"],
+.em-landing [class~="bg-red-950/40"] {
+  background: linear-gradient(135deg, rgb(244 63 94 / 0.14), rgb(251 113 133 / 0.04));
+  border-color: rgb(251 113 133 / 0.4);
+  border-left: 3px solid #fb7185;
+  color: #fda4af;
+  box-shadow: 0 0 24px -12px rgb(244 63 94 / 0.55);
+}
+
+/* ---------- Motion preferences ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .em-landing *,
+  .em-landing *::before,
+  .em-landing *::after {
+    transition: none !important;
+    transform: none !important;
+  }
 }
 
 /* Report -> PDF export. The report is exported via the browser's native

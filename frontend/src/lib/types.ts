@@ -270,6 +270,13 @@ export interface SessionStartRequest {
    * context. Unlike user_capability_description it does NOT change how the
    * evaluation itself runs. */
   agent_brief?: string | null;
-  /** Project to file this session under (chosen in "Organize this evaluation"). */
+  /** Project to file this session under (the project chosen on the start page). */
   project_id?: string | null;
+}
+
+/** The project a new evaluation belongs to. Only the id is sent to the backend
+ * (as `project_id` on the start request); the name is kept for display. */
+export interface ProjectTarget {
+  id: string;
+  name: string;
 }
