@@ -337,7 +337,6 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
 
         {/* Single-column layout: all sections stack cleanly */}
         <div className="flex min-w-0 flex-col gap-6">
-        <div className="flex min-w-0 flex-col gap-6">
         <div className="flex flex-col gap-3 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
           <span className={`${SECTION_LABEL} em-sec--conn`}>Connection type</span>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4 [&>button]:py-3 [&>button]:text-center">
@@ -1035,7 +1034,6 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
 
         {connectionMode !== "http" && describeChatbotField}
         </div>
-        </div>
 
         {/* ── Evaluation settings — full width inline ─────────────────── */}
         <div className="flex flex-col gap-4 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
@@ -1193,6 +1191,8 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
               </p>
             </div>
           )}
+        </div>
+        {/* end single-column wrapper */}
         </div>
 
         {formError && (
