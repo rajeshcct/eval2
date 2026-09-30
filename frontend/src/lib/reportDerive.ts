@@ -339,6 +339,37 @@ export function deriveTokenUsage(perf: PerformanceAndCost): TokenUsage {
   };
 }
 
+export interface EvaluatorUsage {
+  totalTokens: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cost: number | null;
+  /** Some (not all) rounds had no figure, so the total undercounts. */
+  tokensPartial: boolean;
+  costPartial: boolean;
+  missingRounds: number;
+  missingCostRounds: number;
+}
+
+/** EvalMind's own Generator + Judge LLM usage. null = not recorded (older
+ * sessions, or a provider that reports no usage) -- never shown as 0. */
+export function deriveEvaluatorUsage(perf: PerformanceAndCost): EvaluatorUsage {
+  const missing = perf.rounds_missing_evaluator_data ?? 0;
+  const missingCost = perf.rounds_missing_evaluator_cost ?? 0;
+  const total = perf.evaluator_total_tokens ?? null;
+  const cost = perf.evaluator_total_cost ?? null;
+  return {
+    totalTokens: total,
+    inputTokens: perf.evaluator_prompt_tokens ?? null,
+    outputTokens: perf.evaluator_completion_tokens ?? null,
+    cost,
+    tokensPartial: total !== null && missing > 0,
+    costPartial: cost !== null && missingCost > 0,
+    missingRounds: missing,
+    missingCostRounds: missingCost,
+  };
+}
+
 // ==========================================================================
 // AI / Session Details + Agent Profile — only rows the backend really has
 // ==========================================================================

@@ -33,6 +33,7 @@ from crewai import Agent, Crew, Process, Task
 
 from agents.schemas import JudgeScore
 from config.llm_config import get_llm
+from config.usage import record_crew_usage
 
 VALID_CATEGORIES = ("functionality", "security", "compliance")
 
@@ -268,6 +269,7 @@ def judge_round(task: str, output: str, category: str) -> JudgeScore:
             else:
                 crew_output = crew.kickoff()
 
+            record_crew_usage(crew_output, crew=crew, agent=agent, role="judge")
             result = _extract_pydantic_result(crew_output, judge_task)
             if result is None:
                 raise JudgeError(

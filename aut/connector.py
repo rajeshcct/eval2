@@ -398,6 +398,68 @@ def _extract_output_text(body: Any) -> str:
     )
 
 
+_USAGE_CONTAINERS = ("usage", "token_usage", "usage_metadata", "usageMetadata", "metadata", "meta", "data")
+_USAGE_TOTAL_KEYS = ("tokens_used", "total_tokens", "totalTokens", "totalTokenCount", "total_token_count", "tokens")
+_USAGE_IN_KEYS = ("prompt_tokens", "input_tokens", "promptTokens", "inputTokens", "promptTokenCount")
+_USAGE_OUT_KEYS = ("completion_tokens", "output_tokens", "completionTokens", "outputTokens", "candidatesTokenCount")
+_USAGE_COST_KEYS = ("estimated_cost", "cost", "total_cost", "cost_usd", "totalCost")
+
+
+def _as_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _usage_from_dict(d: dict) -> tuple[Optional[int], Optional[float]]:
+    tokens: Optional[int] = None
+    for key in _USAGE_TOTAL_KEYS:
+        v = _as_number(d.get(key))
+        if v is not None and v > 0:
+            tokens = int(v)
+            break
+    if tokens is None:
+        parts = [_as_number(d.get(k)) for k in _USAGE_IN_KEYS + _USAGE_OUT_KEYS]
+        parts = [p for p in parts if p is not None]
+        if parts and sum(parts) > 0:
+            tokens = int(sum(parts))
+    cost: Optional[float] = None
+    for key in _USAGE_COST_KEYS:
+        v = _as_number(d.get(key))
+        if v is not None:
+            cost = v
+            break
+    return tokens, cost
+
+
+def _extract_usage(body: Any) -> tuple[Optional[int], Optional[float]]:
+    """Best-effort read of token/cost figures an AUT reports in its JSON body.
+
+    Looks at the top level and one level down under the usual containers
+    (OpenAI-style `usage.total_tokens` / `prompt_tokens`+`completion_tokens`,
+    Anthropic `input_tokens`+`output_tokens`, Gemini `usageMetadata`, or a flat
+    `tokens_used` / `estimated_cost`). Returns None for anything the AUT did
+    not actually report -- never a guessed or stand-in value.
+    """
+    if not isinstance(body, dict):
+        return None, None
+    tokens, cost = _usage_from_dict(body)
+    for key in _USAGE_CONTAINERS:
+        inner = body.get(key)
+        if isinstance(inner, dict):
+            t, c = _usage_from_dict(inner)
+            tokens = tokens if tokens is not None else t
+            cost = cost if cost is not None else c
+    return tokens, cost
+
+
 def _call_custom_endpoint(task: str, config: CustomEndpointConfig) -> AUTResponse:
     start = time.perf_counter()
     try:
@@ -438,8 +500,7 @@ def _call_custom_endpoint(task: str, config: CustomEndpointConfig) -> AUTRespons
     # Tokens/cost usually aren't available from a bare test endpoint, but if
     # the real AUT happens to report them, pass them through rather than
     # discarding them.
-    tokens_used = body.get("tokens_used") if isinstance(body, dict) else None
-    estimated_cost = body.get("estimated_cost") if isinstance(body, dict) else None
+    tokens_used, estimated_cost = _extract_usage(body)
 
     return AUTResponse(
         output=output,
@@ -513,6 +574,7 @@ def _call_socketio_endpoint(task: str, config: SocketIOEndpointConfig) -> AUTRes
     error_message: dict[str, str] = {}
     finished = threading.Event()
     silence_triggered = threading.Event()  # set if we finished via token-silence fallback
+    usage_info: dict[str, Any] = {}  # tokens/cost, if the AUT reports them on chat:done
 
     import requests as _requests
     _http_session = _requests.Session()
@@ -558,6 +620,12 @@ def _call_socketio_endpoint(task: str, config: SocketIOEndpointConfig) -> AUTRes
 
     @client.on("chat:done")
     def _on_done(data=None):
+        if isinstance(data, dict):
+            t, c = _extract_usage(data)
+            if t is not None:
+                usage_info["tokens"] = t
+            if c is not None:
+                usage_info["cost"] = c
         finished.set()
 
     @client.on("connect_error")
@@ -640,11 +708,10 @@ def _call_socketio_endpoint(task: str, config: SocketIOEndpointConfig) -> AUTRes
     return AUTResponse(
         output=output_text,
         latency_ms=latency_ms,
-        # Streaming chat backends built like this one generally don't report
-        # token/cost accounting over the socket -- left as None rather than
-        # guessed at, same rule as every other mode in this file.
-        tokens_used=None,
-        estimated_cost=None,
+        # Only what the AUT itself reported on chat:done (see _extract_usage);
+        # None when it reports nothing -- never guessed at.
+        tokens_used=usage_info.get("tokens"),
+        estimated_cost=usage_info.get("cost"),
     )
 
 
@@ -791,8 +858,7 @@ def _call_swagger_endpoint(task: str, config: SwaggerEndpointConfig) -> AUTRespo
         )
 
     output = _extract_output_text(body)
-    tokens_used = body.get("tokens_used") if isinstance(body, dict) else None
-    estimated_cost = body.get("estimated_cost") if isinstance(body, dict) else None
+    tokens_used, estimated_cost = _extract_usage(body)
 
     return AUTResponse(
         output=output,

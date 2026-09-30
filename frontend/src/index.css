@@ -167,6 +167,22 @@ body {
   --em-glow-h: rgb(139 92 246 / 0.45);
 }
 
+/* Sidebar — setup summary card (teal), sits directly under Evaluation
+ * settings so the two read as one connected "dials + readout" sidebar. */
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]:has(.em-sec--summary) {
+  --em-fill: linear-gradient(165deg, #0c2a2e 0%, #081f27 100%);
+  --em-tint: rgb(45 212 191 / 0.12);
+  --em-b1: rgb(45 212 191 / 0.48);
+  --em-b2: rgb(34 211 238 / 0.18);
+  --em-b3: rgb(52 211 153 / 0.28);
+  --em-glow: rgb(45 212 191 / 0.22);
+  --em-glow-h: rgb(45 212 191 / 0.4);
+  --em-line: rgb(45 212 191 / 0.9);
+}
+.em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]:has(.em-sec--summary)::after {
+  opacity: 0.95;
+}
+
 /* Hierarchy — 5 & 6: quieter cards, each with its own faint hue */
 .em-landing [class~="rounded-xl"][class~="bg-slate-900/40"]:has(> .em-sec--proj) {
   --em-fill: linear-gradient(165deg, #11163a 0%, #0a0f2c 100%);
@@ -240,6 +256,8 @@ body {
 .em-landing .em-sec--hist::before { content: "\25C9"; }
 .em-landing .em-sec--org { --ac: 232 121 249; }
 .em-landing .em-sec--org::before { content: "\25C7"; }
+.em-landing .em-sec--summary { --ac: 45 212 191; }
+.em-landing .em-sec--summary::before { content: "\2713"; }
 
 /* ---------- Nested panels / rows ---------- */
 
@@ -380,6 +398,30 @@ body {
     linear-gradient(135deg, #34d399, #22d3ee) border-box;
   box-shadow: 0 0 0 1px rgb(52 211 153 / 0.12), 0 0 26px -6px rgb(52 211 153 / 0.5);
   color: #a7f3d0;
+}
+/* Category filter chips (functionality/security/compliance) in the sidebar
+ * keep their own category colour — matching categoryTheme.ts — instead of
+ * the generic indigo "selected" chrome above. */
+.em-landing button[aria-pressed="true"][class~="border-sky-500/50"],
+.em-landing button[aria-pressed="true"][class~="border-sky-500/50"]:hover {
+  background: rgb(14 165 233 / 0.16);
+  border-color: rgb(56 189 248 / 0.6);
+  box-shadow: 0 0 14px -6px rgb(56 189 248 / 0.55);
+  color: #bae6fd;
+}
+.em-landing button[aria-pressed="true"][class~="border-fuchsia-500/50"],
+.em-landing button[aria-pressed="true"][class~="border-fuchsia-500/50"]:hover {
+  background: rgb(217 70 239 / 0.16);
+  border-color: rgb(232 121 249 / 0.6);
+  box-shadow: 0 0 14px -6px rgb(232 121 249 / 0.55);
+  color: #f5d0fe;
+}
+.em-landing button[aria-pressed="true"][class~="border-amber-500/50"],
+.em-landing button[aria-pressed="true"][class~="border-amber-500/50"]:hover {
+  background: rgb(245 158 11 / 0.16);
+  border-color: rgb(251 191 36 / 0.6);
+  box-shadow: 0 0 14px -6px rgb(251 191 36 / 0.55);
+  color: #fde68a;
 }
 /* "Describe your chatbot" enabled state */
 .em-landing button[class~="border-cyan-500"] {

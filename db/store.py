@@ -31,6 +31,7 @@ def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
         conn.commit()
         _migrate_add_reasoning_column(conn)
         _migrate_add_session_columns(conn)
+        _migrate_add_eval_usage_columns(conn)
     finally:
         conn.close()
 
@@ -46,6 +47,27 @@ def _migrate_add_reasoning_column(conn: sqlite3.Connection) -> None:
     if "reasoning" not in existing_columns:
         conn.execute("ALTER TABLE rounds ADD COLUMN reasoning TEXT")
         conn.commit()
+
+
+def _migrate_add_eval_usage_columns(conn: sqlite3.Connection) -> None:
+    """Add the evaluator-usage columns (EvalMind's own Generator + Judge tokens
+    and cost per round) to `rounds` on databases created before they existed.
+    Same pattern as the other migrations: PRAGMA table_info first, no-op when
+    the columns are already there.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(rounds)").fetchall()}
+    for name, decl in (
+        ("eval_tokens", "INTEGER"),
+        ("eval_prompt_tokens", "INTEGER"),
+        ("eval_completion_tokens", "INTEGER"),
+        ("eval_cost", "REAL"),
+    ):
+        if name not in existing:
+            conn.execute(f"ALTER TABLE rounds ADD COLUMN {name} {decl}")
+    session_cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+    if "eval_usage" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN eval_usage TEXT")
+    conn.commit()
 
 
 def _migrate_add_session_columns(conn: sqlite3.Connection) -> None:
@@ -127,6 +149,45 @@ def update_session_description(
         conn.close()
 
 
+def add_session_eval_usage(
+    session_id: str,
+    usage: dict[str, Any],
+    db_path: Path = DEFAULT_DB_PATH,
+) -> None:
+    """ADD session-level evaluator usage (Describer, Aggregator verdict,
+    re-judge -- work that belongs to no single round) to what is already stored
+    on the session row. `usage` is config.usage.collect_session_usage()'s dict.
+    A no-op when it recorded nothing or the session doesn't exist. Tokens and
+    cost accumulate across calls; cost_unknown sticks once any call was unpriced.
+    """
+    if not usage or not usage.get("tokens"):
+        return
+    conn = _connect(db_path)
+    try:
+        row = conn.execute("SELECT eval_usage FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if row is None:
+            return
+        try:
+            current = json.loads(row["eval_usage"]) if row["eval_usage"] else {}
+        except (TypeError, ValueError):
+            current = {}
+
+        def _add(key: str) -> int:
+            return int(current.get(key) or 0) + int(usage.get(key) or 0)
+
+        merged = {
+            "tokens": _add("tokens"),
+            "prompt_tokens": _add("prompt_tokens"),
+            "completion_tokens": _add("completion_tokens"),
+            "cost": round(float(current.get("cost") or 0.0) + float(usage.get("cost") or 0.0), 6),
+            "cost_unknown": bool(current.get("cost_unknown")) or bool(usage.get("cost_unknown")),
+        }
+        conn.execute("UPDATE sessions SET eval_usage = ? WHERE id = ?", (json.dumps(merged), session_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_session(session_id: str, db_path: Path = DEFAULT_DB_PATH) -> Optional[dict[str, Any]]:
     """Fetch one session row (id, aut_description, started_at), or None if it
     doesn't exist. Added for Block G's Aggregator, which needs a session's
@@ -158,6 +219,10 @@ def insert_round(
     tokens_used: Optional[int] = None,
     estimated_cost: Optional[float] = None,
     db_path: Path = DEFAULT_DB_PATH,
+    eval_tokens: Optional[int] = None,
+    eval_prompt_tokens: Optional[int] = None,
+    eval_completion_tokens: Optional[int] = None,
+    eval_cost: Optional[float] = None,
 ) -> None:
     """Insert one test round. primary_scores/secondary_scores are dicts, stored as JSON.
     reasoning is the Judge's short free-text explanation (agents.schemas.JudgeScore.reasoning),
@@ -173,8 +238,9 @@ def insert_round(
             INSERT INTO rounds (
                 id, session_id, category, round_number, difficulty, task, output,
                 primary_scores, secondary_scores, reasoning, pass_fail,
-                latency_ms, tokens_used, estimated_cost
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                latency_ms, tokens_used, estimated_cost,
+                eval_tokens, eval_prompt_tokens, eval_completion_tokens, eval_cost
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 id,
@@ -191,6 +257,10 @@ def insert_round(
                 latency_ms,
                 tokens_used,
                 estimated_cost,
+                eval_tokens,
+                eval_prompt_tokens,
+                eval_completion_tokens,
+                eval_cost,
             ),
         )
         conn.commit()

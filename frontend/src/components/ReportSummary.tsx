@@ -5,6 +5,7 @@ import {
   STATE_LABELS,
   deriveAgentProfile,
   deriveOverview,
+  deriveEvaluatorUsage,
   deriveSessionDetails,
   deriveTokenUsage,
   formatCost,
@@ -26,7 +27,7 @@ import type { CategoryStat, OverallSummary, Tone } from "../lib/reportDerive";
 // each with a light `print:` counterpart so "Download PDF" stays ink-friendly.
 // ==========================================================================
 const CARD =
-  "rounded-lg border border-slate-800 bg-slate-900/40 p-4 print:break-inside-avoid print:border-slate-300 print:bg-white";
+  "rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6 print:break-inside-avoid print:border-slate-300 print:bg-white";
 const CARD_TITLE = "font-serif text-lg font-semibold text-slate-100 print:text-slate-900";
 const EYEBROW = "font-mono text-[11px] uppercase tracking-wide text-slate-500 print:text-slate-600";
 const VALUE = "text-sm text-slate-200 print:text-slate-900";
@@ -203,9 +204,9 @@ export function ExecutiveSummary({
           <button
             type="button"
             onClick={onViewFull}
-            className="rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500"
+            className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-violet-600 to-indigo-500 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-indigo-900/40 transition-all hover:brightness-110"
           >
-            View Full Report
+            View Full Report <span aria-hidden>→</span>
           </button>
           <button
             type="button"
@@ -363,8 +364,33 @@ export function SessionDetailsCard({ report }: { report: FinalReport }) {
 // ==========================================================================
 export function TokenUsageCard({ report }: { report: FinalReport }) {
   const usage = deriveTokenUsage(report.performance_and_cost);
+  const evalUsage = deriveEvaluatorUsage(report.performance_and_cost);
   const perf = report.performance_and_cost;
 
+  const evalTiles: { label: string; value: ReactNode; note?: string }[] = [
+    {
+      label: "Input tokens",
+      value: evalUsage.inputTokens !== null ? evalUsage.inputTokens.toLocaleString() : <NotAvailable />,
+    },
+    {
+      label: "Output tokens",
+      value: evalUsage.outputTokens !== null ? evalUsage.outputTokens.toLocaleString() : <NotAvailable />,
+    },
+    {
+      label: "Total tokens",
+      value: evalUsage.totalTokens !== null ? evalUsage.totalTokens.toLocaleString() : <NotAvailable />,
+      note: evalUsage.tokensPartial
+        ? `${evalUsage.missingRounds}/${perf.total_rounds} rounds recorded none`
+        : undefined,
+    },
+    {
+      label: "Estimated cost",
+      value: evalUsage.cost !== null ? formatCost(evalUsage.cost) : <NotAvailable />,
+      note: evalUsage.costPartial
+        ? `${evalUsage.missingCostRounds}/${perf.total_rounds} rounds could not be priced`
+        : undefined,
+    },
+  ];
   const tiles: { label: string; value: ReactNode; note?: string }[] = [
     // The backend records a single total per round and no input/output split.
     { label: "Input tokens", value: <NotAvailable /> },
@@ -386,7 +412,8 @@ export function TokenUsageCard({ report }: { report: FinalReport }) {
   return (
     <section className={CARD}>
       <h2 className={CARD_TITLE}>Token Usage</h2>
-      <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <p className={`${EYEBROW} mt-3`}>Agent under test</p>
+      <div className="mt-2 grid grid-cols-2 gap-3 sm:grid-cols-4">
         {tiles.map((t) => (
           <div key={t.label} className="rounded-md border border-slate-800 bg-slate-950/40 p-3 print:border-slate-200 print:bg-white">
             <div className={EYEBROW}>{t.label}</div>
@@ -395,9 +422,33 @@ export function TokenUsageCard({ report }: { report: FinalReport }) {
           </div>
         ))}
       </div>
+      {usage.totalTokens === null && usage.estimatedCost === null ? (
+        <p className="mt-3 rounded-md border border-amber-800/60 bg-amber-950/20 px-3 py-2 text-xs text-amber-300 print:border-amber-300 print:bg-amber-50 print:text-amber-800">
+          The agent under test did not report token or cost figures for any round, so there is nothing to total.
+          Browser (Playwright) and most streaming chat backends don&apos;t expose usage; HTTP, Swagger and
+          Socket.IO agents show it only if their response includes it (e.g. a <code>usage</code> object or
+          <code> tokens_used</code>).
+        </p>
+      ) : (
+        <p className="mt-3 text-xs text-slate-500 print:text-slate-600">
+          Figures are whatever the agent under test reported for its own replies. Nothing is estimated.
+        </p>
+      )}
+
+      <p className={`${EYEBROW} mt-5`}>EvalMind evaluator (task generator + judge)</p>
+      <div className="mt-2 grid grid-cols-2 gap-3 sm:grid-cols-4">
+        {evalTiles.map((t) => (
+          <div key={t.label} className="rounded-md border border-indigo-900/60 bg-indigo-950/20 p-3 print:border-slate-200 print:bg-white">
+            <div className={EYEBROW}>{t.label}</div>
+            <div className="mt-1 font-mono text-sm text-slate-100 print:text-slate-900">{t.value}</div>
+            {t.note && <div className="mt-1 text-[11px] text-slate-500 print:text-slate-600">{t.note}</div>}
+          </div>
+        ))}
+      </div>
       <p className="mt-3 text-xs text-slate-500 print:text-slate-600">
-        Figures are whatever the agent under test reported for its own replies. Nothing is estimated, and
-        EvalMind&apos;s own evaluator usage is not tracked.
+        The models EvalMind itself uses to write test tasks and judge replies. Cost is tokens × the model&apos;s
+        list price, and is left blank for a model whose price is unknown. Sessions run before this was tracked
+        show no figures.
       </p>
     </section>
   );

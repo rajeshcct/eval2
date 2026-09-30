@@ -177,6 +177,16 @@ class PerformanceAndCost(BaseModel):
     average_estimated_cost: Optional[float] = None
     rounds_missing_cost_data: int
 
+    # EvalMind's OWN LLM usage (Generator + Judge calls), separate from the
+    # Agent Under Test's figures above. None when no round recorded any (e.g.
+    # sessions run before this was tracked, or a provider that reports no usage).
+    evaluator_total_tokens: Optional[int] = None
+    evaluator_prompt_tokens: Optional[int] = None
+    evaluator_completion_tokens: Optional[int] = None
+    evaluator_total_cost: Optional[float] = None
+    rounds_missing_evaluator_data: int = 0
+    rounds_missing_evaluator_cost: int = 0
+
 
 class FinalReport(BaseModel):
     """The complete Block G deliverable: reconstructible from session_id
@@ -336,6 +346,25 @@ def _group_rounds_by_category(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict
 # ==========================================================================
 # Performance & cost aggregation — across every round, every category.
 # ==========================================================================
+def _aggregate_evaluator_usage(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Sum EvalMind's own per-round Generator + Judge usage. Rounds with no
+    figure are left out of the sums (never counted as 0) and counted in
+    rounds_missing_evaluator_*, so a partial total is visible as partial."""
+    total_rounds = len(rows)
+    tokens = [r["eval_tokens"] for r in rows if r.get("eval_tokens") is not None]
+    prompts = [r["eval_prompt_tokens"] for r in rows if r.get("eval_prompt_tokens") is not None]
+    completions = [r["eval_completion_tokens"] for r in rows if r.get("eval_completion_tokens") is not None]
+    costs = [r["eval_cost"] for r in rows if r.get("eval_cost") is not None]
+    return {
+        "evaluator_total_tokens": int(sum(tokens)) if tokens else None,
+        "evaluator_prompt_tokens": int(sum(prompts)) if prompts else None,
+        "evaluator_completion_tokens": int(sum(completions)) if completions else None,
+        "evaluator_total_cost": round(float(sum(costs)), 6) if costs else None,
+        "rounds_missing_evaluator_data": total_rounds - len(tokens),
+        "rounds_missing_evaluator_cost": total_rounds - len(costs),
+    }
+
+
 def _aggregate_performance_and_cost(rows: List[Dict[str, Any]]) -> PerformanceAndCost:
     total_rounds = len(rows)
 
@@ -362,6 +391,7 @@ def _aggregate_performance_and_cost(rows: List[Dict[str, Any]]) -> PerformanceAn
         total_estimated_cost=round(float(total_estimated_cost), 6),
         average_estimated_cost=average_estimated_cost,
         rounds_missing_cost_data=total_rounds - len(costs),
+        **_aggregate_evaluator_usage(rows),
     )
 
 

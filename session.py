@@ -50,7 +50,14 @@ from agents.judge import JUDGE_TEMPERATURE, PASS_THRESHOLD
 from agents.schemas import DescriptionComparisonResult, DescriberResult
 from aut.connector import AUTConfig
 from config.llm_config import describe_evaluator_llm
-from db.store import get_rounds_for_session, init_db, insert_session, update_session_description
+from config.usage import collect_session_usage, start_session_collection
+from db.store import (
+    add_session_eval_usage,
+    get_rounds_for_session,
+    init_db,
+    insert_session,
+    update_session_description,
+)
 from loop_runner import CategoryLoopResult, run_category_loop
 from progress import OnEvent, emit_event
 
@@ -72,9 +79,19 @@ _DISCOVERY_PENDING_DESCRIPTION = "(auto-discovery in progress...)"
 MAX_CONSECUTIVE_CATEGORY_FAILURES = 2
 
 
+def _flush_session_usage(session_id: str) -> None:
+    """Best-effort: save the evaluator usage recorded outside any round (the
+    Describer / description comparison) onto the session row. Never raises."""
+    try:
+        add_session_eval_usage(session_id, collect_session_usage())
+    except Exception:  # noqa: BLE001 - usage tracking must never break a run
+        pass
+
+
 def _mark_session_failed(session_id: str, message: str) -> None:
     """Best-effort: record why a session died before it produced any rounds,
     by overwriting its placeholder description. Never raises."""
+    _flush_session_usage(session_id)  # a failed discovery still cost tokens
     try:
         update_session_description(session_id, message[:300])
     except Exception:  # noqa: BLE001 - diagnostics must never mask the real error
@@ -223,6 +240,7 @@ def run_full_session(
                                      persisted by this point either way).
     """
     init_db()
+    start_session_collection()  # Describer / comparison usage; flushed below
 
     # Everything from here down is wrapped in try/finally so that a
     # browser-mode aut_config always gets its Chromium session torn down —
@@ -282,6 +300,8 @@ def run_full_session(
                 raise
             capability_description = describer_result.capability_description
             update_session_description(session_id, capability_description)
+
+        _flush_session_usage(session_id)
 
         active_categories = categories if categories else list(CATEGORIES)
 

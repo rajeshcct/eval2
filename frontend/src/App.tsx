@@ -432,7 +432,7 @@ export default function App() {
 
         {/* ── Report ───────────────────────────────────────────────────── */}
         {appState === "report" && reportStatus === "loaded" && finalReport && (
-          <div className="flex-1 overflow-y-auto">
+          <div className="flex-1 overflow-y-auto px-4 py-6 sm:px-8">
             <ReportView report={finalReport} onReset={handleReset} onStartAnother={handleStartAnother} />
           </div>
         )}
@@ -483,7 +483,7 @@ export default function App() {
                         <span className="text-sm font-medium text-slate-200">{presetProject.name}</span>
                       </div>
                     </div>
-                    <div className="mx-auto w-full max-w-4xl px-6 py-6">
+                    <div className="mx-auto w-full max-w-6xl px-6 py-6">
                       <NewSessionForm
                         onStart={handleStart}
                         onLoadReport={loadReportById}

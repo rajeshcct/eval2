@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { resolveProjectConfig, saveProjectConfig } from "../lib/projectConfig";
 import SessionHistoryPanel from "./SessionHistoryPanel";
+import { themeFor } from "./categoryTheme";
 import type { ProjectTarget } from "../lib/types";
 import type {
   AUTConnectionRequest,
@@ -95,6 +96,34 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
   const [startDifficulty, setStartDifficulty] = useState<number>(1);
   const [maxDifficulty, setMaxDifficulty] = useState<number>(5);
   const [passThreshold, setPassThreshold] = useState<number>(6);
+
+  // Derived, read-only display values for the "Setup summary" sidebar card —
+  // recomputed each render from whichever connection mode is active.
+  const currentEndpoint =
+    connectionMode === "http"
+      ? connection.chat_endpoint_url.trim()
+      : connectionMode === "socketio"
+        ? socketioConnection.chat_endpoint_url.trim()
+        : connectionMode === "swagger"
+          ? swaggerConnection.chat_endpoint_url.trim()
+          : browserConnection.chatbot_url.trim();
+
+  const currentAuthLabel =
+    connectionMode === "http"
+      ? connection.requires_login
+        ? "Login (username / password)"
+        : "None configured"
+      : connectionMode === "socketio"
+        ? socketioConnection.bearer_token.trim()
+          ? "Bearer token (JWT)"
+          : "Token not set yet"
+        : connectionMode === "swagger"
+          ? swaggerConnection.bearer_token?.trim()
+            ? "Bearer token"
+            : "None configured"
+          : browserConnection.requires_login
+            ? "Browser login (username / password)"
+            : "None configured";
 
   useEffect(() => {
     if (!initialProject) return;
@@ -335,7 +364,13 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
           </header>
         )}
 
-        {/* Single-column layout: all sections stack cleanly */}
+        {/* Dashboard grid: connection setup (left, grows with content) next
+         * to a sticky settings/summary sidebar (right). Sticky is what keeps
+         * the sidebar from stranding a big empty gap under it when the left
+         * column gets much taller than it — login fields expanding, the
+         * chatbot description opening, or switching to Browser mode's long
+         * selector list all used to do exactly that. */}
+        <div className="grid grid-cols-1 gap-6 lg:items-stretch lg:grid-cols-[minmax(0,1fr)_340px]">
         <div className="flex min-w-0 flex-col gap-6">
         <div className="flex flex-col gap-3 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
           <span className={`${SECTION_LABEL} em-sec--conn`}>Connection type</span>
@@ -393,7 +428,7 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
           </div>
         </div>
 
-        <div className="flex flex-col gap-6 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
+        <div className="flex flex-1 flex-col gap-6 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
           <span className={`${SECTION_LABEL} ${connectionMode === "browser" ? "em-sec--browser" : "em-sec--cfg"}`}>
             {connectionMode === "browser" ? "Browser automation" : "Connection configuration"}
@@ -1034,33 +1069,108 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
 
         {connectionMode !== "http" && describeChatbotField}
         </div>
+        </div>
 
-        {/* ── Evaluation settings — full width inline ─────────────────── */}
-        <div className="flex flex-col gap-4 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
+        {/* ── Right sidebar: evaluation dials + a live setup summary. Sticky
+             at lg (this form's container caps out around 1152px, so xl
+             rarely fires here) so it tracks alongside the left column on
+             scroll instead of stranding empty space when that column grows
+             taller ─────────────────────────────────────────────────── */}
+        <aside className="flex min-w-0 flex-col gap-6">
+        <div className="flex flex-col gap-5 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
           <div className="border-b border-slate-800 pb-3">
             <span className={`${SECTION_LABEL} em-sec--set`}>Evaluation settings</span>
           </div>
 
-          {/* Always-visible: max rounds + advanced toggle in one row */}
-          <div className="flex flex-wrap items-end gap-6">
+          <div className="flex flex-col gap-2">
+            <label htmlFor="max_rounds" className="text-sm font-medium text-slate-200">
+              Max rounds per category
+            </label>
+            <input
+              id="max_rounds"
+              type="number"
+              min={1}
+              max={5}
+              value={maxRounds}
+              onChange={(e) => setMaxRounds(Number(e.target.value))}
+              className="w-24 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            />
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <span className="text-sm font-medium text-slate-200">Categories to evaluate</span>
+            <div className="flex flex-wrap gap-2">
+              {ALL_CATEGORIES.map((cat) => {
+                const theme = themeFor(cat);
+                const on = selectedCategories.includes(cat);
+                return (
+                  <button
+                    key={cat}
+                    type="button"
+                    onClick={() => toggleCategory(cat)}
+                    aria-pressed={on}
+                    className={`flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium capitalize transition-colors ${
+                      on
+                        ? `${theme.border} ${theme.soft} ${theme.text}`
+                        : "border-slate-700 bg-slate-900 text-slate-500 hover:bg-slate-800"
+                    }`}
+                  >
+                    <span aria-hidden>{theme.icon}</span>
+                    {cat}
+                  </button>
+                );
+              })}
+            </div>
+            <p className="text-xs text-slate-500">Tap to include or skip a category for this run.</p>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
             <div className="flex flex-col gap-2">
-              <label htmlFor="max_rounds" className="text-sm font-medium text-slate-200">
-                Max rounds per category
+              <label htmlFor="start_difficulty" className="text-sm font-medium text-slate-200">
+                Start difficulty
               </label>
               <input
-                id="max_rounds"
-                type="number"
-                min={1}
-                max={5}
-                value={maxRounds}
-                onChange={(e) => setMaxRounds(Number(e.target.value))}
-                className="w-32 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                id="start_difficulty"
+                type="number" min={1} max={5}
+                value={startDifficulty}
+                onChange={(e) => setStartDifficulty(Number(e.target.value))}
+                className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
               />
             </div>
+            <div className="flex flex-col gap-2">
+              <label htmlFor="max_difficulty" className="text-sm font-medium text-slate-200">
+                Max difficulty
+              </label>
+              <input
+                id="max_difficulty"
+                type="number" min={1} max={5}
+                value={maxDifficulty}
+                onChange={(e) => setMaxDifficulty(Number(e.target.value))}
+                className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
+            </div>
+          </div>
+          <p className="-mt-3 text-xs text-slate-500">1–5 each. Raise start difficulty to skip easy rounds.</p>
+
+          <div className="flex flex-col gap-2">
+            <label htmlFor="pass_threshold" className="text-sm font-medium text-slate-200">
+              Pass threshold <span className="text-slate-500">(1–10)</span>
+            </label>
+            <input
+              id="pass_threshold"
+              type="number" min={1} max={10}
+              value={passThreshold}
+              onChange={(e) => setPassThreshold(Number(e.target.value))}
+              className="w-24 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            />
+            <p className="text-xs text-slate-500">Minimum primary-metric score for a round to count as PASS.</p>
+          </div>
+
+          <div className="border-t border-slate-800 pt-3">
             <button
               type="button"
               onClick={() => setShowAdvanced((v) => !v)}
-              className="mb-0.5 flex items-center gap-1.5 text-sm text-indigo-400 hover:text-indigo-300 transition-colors"
+              className="flex items-center gap-1.5 text-sm text-indigo-400 hover:text-indigo-300 transition-colors"
             >
               <svg width="14" height="14" fill="none" viewBox="0 0 24 24" className={`transition-transform ${showAdvanced ? "rotate-180" : ""}`}>
                 <path d="M19 9l-7 7-7-7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
@@ -1069,11 +1179,10 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
             </button>
           </div>
 
-          {/* Advanced options — expand inline below */}
           {showAdvanced && (
-            <div className="flex flex-col gap-6 rounded-lg border border-slate-700/60 bg-slate-900/30 p-4">
+            <div className="flex flex-col gap-4 rounded-lg border border-slate-700/60 bg-slate-900/30 p-4">
               {connectionMode === "http" && (
-                <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                <>
                   <div className="flex flex-col gap-2">
                     <label htmlFor="token_field" className="text-sm font-medium text-slate-200">
                       Login response token field
@@ -1112,87 +1221,115 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
                       className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                     />
                   </div>
-                </div>
+                </>
               )}
 
-              {/* Category selection */}
               <div className="flex flex-col gap-2">
-                <span className="text-sm font-medium text-slate-200">Categories to evaluate</span>
-                <div className="flex flex-wrap gap-4">
-                  {ALL_CATEGORIES.map((cat) => (
-                    <label key={cat} className="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
-                      <input
-                        type="checkbox"
-                        checked={selectedCategories.includes(cat)}
-                        onChange={() => toggleCategory(cat)}
-                        className="h-4 w-4 rounded border-slate-600 bg-slate-800 text-indigo-500 focus:ring-indigo-500"
-                      />
-                      <span className="capitalize">{cat}</span>
-                    </label>
-                  ))}
-                </div>
-                <p className="text-xs text-slate-500">Uncheck categories to skip them entirely in this run.</p>
+                <label htmlFor="capability_override" className="text-sm font-medium text-slate-200">
+                  Capability override <span className="text-slate-500">(optional)</span>
+                </label>
+                <textarea
+                  id="capability_override"
+                  rows={3}
+                  placeholder="Leave blank to auto-discover."
+                  value={capabilityOverride}
+                  onChange={(e) => setCapabilityOverride(e.target.value)}
+                  className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                />
               </div>
-
-              {/* Difficulty + pass threshold in one row */}
-              <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-                <div className="flex flex-col gap-2">
-                  <label htmlFor="start_difficulty" className="text-sm font-medium text-slate-200">
-                    Start difficulty <span className="text-slate-500">(1–5)</span>
-                  </label>
-                  <input
-                    id="start_difficulty"
-                    type="number" min={1} max={5}
-                    value={startDifficulty}
-                    onChange={(e) => setStartDifficulty(Number(e.target.value))}
-                    className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                  />
-                </div>
-                <div className="flex flex-col gap-2">
-                  <label htmlFor="max_difficulty" className="text-sm font-medium text-slate-200">
-                    Max difficulty <span className="text-slate-500">(1–5)</span>
-                  </label>
-                  <input
-                    id="max_difficulty"
-                    type="number" min={1} max={5}
-                    value={maxDifficulty}
-                    onChange={(e) => setMaxDifficulty(Number(e.target.value))}
-                    className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                  />
-                </div>
-                <div className="flex flex-col gap-2">
-                  <label htmlFor="pass_threshold" className="text-sm font-medium text-slate-200">
-                    Pass threshold <span className="text-slate-500">(1–10)</span>
-                  </label>
-                  <input
-                    id="pass_threshold"
-                    type="number" min={1} max={10}
-                    value={passThreshold}
-                    onChange={(e) => setPassThreshold(Number(e.target.value))}
-                    className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                  />
-                </div>
-                <div className="flex flex-col gap-2">
-                  <label htmlFor="capability_override" className="text-sm font-medium text-slate-200 sm:col-span-4">
-                    Capability override <span className="text-slate-500">(optional)</span>
-                  </label>
-                  <textarea
-                    id="capability_override"
-                    rows={2}
-                    placeholder="Leave blank to auto-discover."
-                    value={capabilityOverride}
-                    onChange={(e) => setCapabilityOverride(e.target.value)}
-                    className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 placeholder:text-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                  />
-                </div>
-              </div>
-              <p className="-mt-4 text-xs text-slate-500">
-                Default difficulty 1→5. Raise start difficulty to skip easy rounds. Pass threshold is the minimum score for a round to count as PASS.
-              </p>
             </div>
           )}
         </div>
-        {/* end single-column wrapper */}
+
+        {/* Live setup summary — everything chosen above, at a glance. Also
+             gives the sidebar substantial, steady content so it never reads
+             as a half-empty column next to the connection card. */}
+        <div className="flex flex-1 flex-col gap-4 rounded-xl border border-slate-800 bg-slate-900/40 p-5 sm:p-6">
+          <div className="border-b border-slate-800 pb-3">
+            <span className={`${SECTION_LABEL} em-sec--summary`}>Setup summary</span>
+          </div>
+
+          <div className="flex flex-col gap-2.5 text-sm">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-slate-400">Connection</span>
+              <span className={`font-medium ${MODE_ACCENT[connectionMode]}`}>{MODE_LABEL[connectionMode]}</span>
+            </div>
+            <div className="flex items-start justify-between gap-3">
+              <span className="shrink-0 text-slate-400">Endpoint</span>
+              <span className="truncate text-right text-slate-200" title={currentEndpoint || undefined}>
+                {currentEndpoint || <span className="text-slate-500">Not set yet</span>}
+              </span>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-slate-400">Auth</span>
+              <span className="text-right text-slate-200">{currentAuthLabel}</span>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-slate-400">Chatbot description</span>
+              <span className={userDescription.trim() ? "font-medium text-cyan-300" : "text-slate-500"}>
+                {userDescription.trim() ? "Added" : "Not set (optional)"}
+              </span>
+            </div>
+          </div>
+
+          <div className="h-px bg-slate-800" />
+
+          <div className="flex flex-wrap gap-1.5">
+            {ALL_CATEGORIES.map((cat) => {
+              const theme = themeFor(cat);
+              const on = selectedCategories.includes(cat);
+              return (
+                <span
+                  key={cat}
+                  className={`rounded-full border px-2.5 py-1 text-[11px] font-medium capitalize ${
+                    on
+                      ? `${theme.border} ${theme.soft} ${theme.text}`
+                      : "border-slate-800 bg-slate-900/60 text-slate-600 line-through decoration-slate-700"
+                  }`}
+                >
+                  {theme.icon} {cat}
+                </span>
+              );
+            })}
+          </div>
+
+          <ul className="flex flex-col gap-1.5 text-xs">
+            {([
+              ["Endpoint set", !!currentEndpoint],
+              ["Categories selected", selectedCategories.length > 0],
+              ["Difficulty range valid", startDifficulty <= maxDifficulty],
+            ] as [string, boolean][]).map(([label, ok]) => (
+              <li key={label} className="flex items-center gap-2">
+                <span className={ok ? "text-emerald-400" : "text-slate-600"}>{ok ? "●" : "○"}</span>
+                <span className={ok ? "text-slate-200" : "text-slate-500"}>{label}</span>
+              </li>
+            ))}
+          </ul>
+
+          <div className="mt-auto grid grid-cols-3 gap-2 text-center">
+            <div className="rounded-lg border border-slate-800 bg-slate-950/40 px-2 py-2.5">
+              <p className="text-lg font-semibold text-slate-100">{maxRounds}</p>
+              <p className="text-[10px] uppercase tracking-wide text-slate-500">Rounds</p>
+            </div>
+            <div className="rounded-lg border border-slate-800 bg-slate-950/40 px-2 py-2.5">
+              <p className="text-lg font-semibold text-slate-100">{startDifficulty}–{maxDifficulty}</p>
+              <p className="text-[10px] uppercase tracking-wide text-slate-500">Difficulty</p>
+            </div>
+            <div className="rounded-lg border border-slate-800 bg-slate-950/40 px-2 py-2.5">
+              <p className="text-lg font-semibold text-slate-100">{passThreshold}/10</p>
+              <p className="text-[10px] uppercase tracking-wide text-slate-500">Pass bar</p>
+            </div>
+          </div>
+
+          {projectTarget && (
+            <div className="flex items-center justify-between rounded-md border border-emerald-900/60 bg-emerald-950/20 px-3 py-2 text-xs">
+              <span className="text-slate-400">Project</span>
+              <span className="font-medium text-emerald-300">{projectTarget.name}</span>
+            </div>
+          )}
+        </div>
+        </aside>
+        {/* end dashboard grid */}
         </div>
 
         {formError && (
@@ -1229,6 +1366,21 @@ export default function NewSessionForm({ onStart, onLoadReport, disabled, initia
 
 /** Shared eyebrow style for the dashboard section headings (presentation only). */
 const SECTION_LABEL = "em-sec font-mono text-[11px] uppercase tracking-[0.2em] text-slate-400";
+
+/** Display label + accent colour per connection mode, used by the "Setup
+ * summary" sidebar card. */
+const MODE_LABEL: Record<"http" | "socketio" | "swagger" | "browser", string> = {
+  http: "HTTP / REST",
+  socketio: "Socket.IO (JWT)",
+  swagger: "Swagger / OpenAPI",
+  browser: "Browser (Playwright)",
+};
+const MODE_ACCENT: Record<"http" | "socketio" | "swagger" | "browser", string> = {
+  http: "text-indigo-300",
+  socketio: "text-indigo-300",
+  swagger: "text-violet-300",
+  browser: "text-emerald-300",
+};
 
 /** Mirrors the backend's max_length on SessionStartRequest.agent_brief. */
 const DESCRIPTION_MAX = 2000;

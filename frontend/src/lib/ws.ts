@@ -60,6 +60,9 @@ export interface RoundResult {
   latency_ms: number;
   tokens_used: number | null;
   estimated_cost: number | null;
+  /** EvalMind's own Generator + Judge usage for this round. */
+  eval_tokens?: number | null;
+  eval_cost?: number | null;
 }
 
 /** Mirrors loop_runner.py::CategoryLoopResult. */
@@ -119,6 +122,15 @@ export interface PerformanceAndCost {
   total_estimated_cost: number;
   average_estimated_cost: number | null;
   rounds_missing_cost_data: number;
+
+  /** EvalMind's own Generator + Judge LLM usage, separate from the agent under
+   * test's figures above. Optional/null on sessions recorded before it was tracked. */
+  evaluator_total_tokens?: number | null;
+  evaluator_prompt_tokens?: number | null;
+  evaluator_completion_tokens?: number | null;
+  evaluator_total_cost?: number | null;
+  rounds_missing_evaluator_data?: number;
+  rounds_missing_evaluator_cost?: number;
 }
 
 /** Mirrors aggregator.py::FinalReport. */

@@ -27,6 +27,7 @@ from crewai import Agent, Crew, Process, Task
 
 from agents.schemas import GeneratedTask
 from config.llm_config import get_llm
+from config.usage import record_crew_usage
 
 VALID_CATEGORIES = ("functionality", "security", "compliance")
 MIN_DIFFICULTY, MAX_DIFFICULTY = 1, 5
@@ -339,6 +340,7 @@ def generate_task(
             else:
                 crew_output = crew.kickoff()
 
+            record_crew_usage(crew_output, crew=crew, agent=agent, role="generator")
             result = _extract_pydantic_result(crew_output, gen_task)
             if result is None:
                 raise GeneratorError(

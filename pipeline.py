@@ -32,6 +32,7 @@ from pydantic import BaseModel
 from agents.generator import generate_task
 from agents.judge import judge_round, compute_passed
 from aut.connector import AUTConfig, call_aut_with_retry
+from config.usage import collect_usage, start_collection
 from db.store import init_db, insert_round, insert_session
 from progress import OnEvent, emit_event
 
@@ -65,6 +66,11 @@ class RoundResult(BaseModel):
     latency_ms: float
     tokens_used: Optional[int] = None
     estimated_cost: Optional[float] = None
+
+    # EvalMind's own LLM usage for this round (Generator + Judge), as opposed to
+    # tokens_used/estimated_cost above, which are the Agent Under Test's.
+    eval_tokens: Optional[int] = None
+    eval_cost: Optional[float] = None
 
 
 def run_single_round(
@@ -124,6 +130,7 @@ def run_single_round(
         aut.connector.AUTConnectorError / ManualLookupError: if the AUT call fails.
     """
     init_db()  # no-op if already initialized; keeps this function runnable standalone
+    start_collection()  # gather Generator + Judge token usage for this round
 
     if session_id is None:
         session_id = str(uuid.uuid4())
@@ -179,6 +186,7 @@ def run_single_round(
     # 4. Persist. latency_ms is stored as an int per db/schema.sql's INTEGER
     #    column; the RoundResult returned below keeps the original float.
     round_id = str(uuid.uuid4())
+    eval_usage = collect_usage()
     insert_round(
         id=round_id,
         session_id=session_id,
@@ -203,6 +211,10 @@ def run_single_round(
         latency_ms=int(round(aut_response.latency_ms)),
         tokens_used=aut_response.tokens_used,
         estimated_cost=aut_response.estimated_cost,
+        eval_tokens=eval_usage["tokens"],
+        eval_prompt_tokens=eval_usage["prompt_tokens"],
+        eval_completion_tokens=eval_usage["completion_tokens"],
+        eval_cost=eval_usage["cost"],
     )
 
     result = RoundResult(
@@ -225,6 +237,8 @@ def run_single_round(
         latency_ms=aut_response.latency_ms,
         tokens_used=aut_response.tokens_used,
         estimated_cost=aut_response.estimated_cost,
+        eval_tokens=eval_usage["tokens"],
+        eval_cost=eval_usage["cost"],
     )
 
     emit_event(on_event, "round_completed", result.model_dump())

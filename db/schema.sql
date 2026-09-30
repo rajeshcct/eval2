@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     started_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     agent_brief     TEXT,      -- optional free-text brief the user gave about the agent
     project_id      TEXT REFERENCES projects(id) ON DELETE SET NULL,
-    session_meta    TEXT       -- JSON: connection + run configuration snapshot (never secrets)
+    session_meta    TEXT,      -- JSON: connection + run configuration snapshot (never secrets)
+    eval_usage      TEXT       -- JSON: session-level evaluator usage (Describer, verdict, re-judge)
 );
 
 CREATE TABLE IF NOT EXISTS rounds (
@@ -45,6 +46,10 @@ CREATE TABLE IF NOT EXISTS rounds (
     latency_ms       INTEGER,
     tokens_used      INTEGER,
     estimated_cost   REAL,
+    eval_tokens             INTEGER,  -- EvalMind's own LLM usage for this round (Generator + Judge)
+    eval_prompt_tokens      INTEGER,
+    eval_completion_tokens  INTEGER,
+    eval_cost               REAL,
     created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 

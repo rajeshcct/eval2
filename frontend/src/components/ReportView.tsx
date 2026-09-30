@@ -11,6 +11,7 @@ import {
   formatDateTime,
 } from "../lib/reportDerive";
 import type { CategoryStat, Tone } from "../lib/reportDerive";
+import { themeFor } from "./categoryTheme";
 import {
   AgentProfileCard,
   CopySessionId,
@@ -511,7 +512,7 @@ function ActionMenu({
         aria-expanded={open}
         aria-label="More actions"
         onClick={() => setOpen((v) => !v)}
-        className="rounded-md border border-slate-700 px-2.5 py-1.5 text-sm leading-none text-slate-300 hover:bg-slate-800"
+        className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-base leading-none text-slate-300 transition-colors hover:bg-slate-800"
       >
         ⋯
       </button>
@@ -556,19 +557,62 @@ function jumpTo(id: string) {
 /** Sticky section bar for the full report: one button per section that
  * actually exists (a category that wasn't evaluated has nothing to jump to).
  * Going back to the summary is the button in the toolbar at the top. */
-function FullReportNav({ sections }: { sections: { id: string; label: string }[] }) {
-  const item =
-    "rounded px-2.5 py-1 text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-slate-50 focus:outline-none focus:ring-1 focus:ring-indigo-500";
+function FullReportNav({ sections }: { sections: { id: string; label: string; icon: string }[] }) {
+  const [active, setActive] = useState<string>(sections[0]?.id ?? "");
+
+  // Scroll-spy: highlight the section currently near the top of the viewport,
+  // so the bar shows where the reader is as well as where they can go.
+  useEffect(() => {
+    const els = sections
+      .map((s) => document.getElementById(s.id))
+      .filter((el): el is HTMLElement => el !== null);
+    if (els.length === 0) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const visible = entries.filter((e) => e.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+        if (visible.length > 0) setActive(visible[0].target.id);
+      },
+      { rootMargin: "-80px 0px -60% 0px", threshold: 0 },
+    );
+    els.forEach((el) => observer.observe(el));
+    return () => observer.disconnect();
+  }, [sections]);
+
   return (
     <nav
       aria-label="Report sections"
-      className="sticky top-0 z-20 flex flex-wrap items-center gap-1 rounded-md border border-slate-800 bg-slate-950/90 px-2 py-1.5 backdrop-blur print:hidden"
+      className="sticky top-2 z-20 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-indigo-500/30 bg-slate-950/85 px-3 py-2 shadow-lg shadow-indigo-950/40 backdrop-blur print:hidden"
     >
-      {sections.map((s) => (
-        <button key={s.id} type="button" onClick={() => jumpTo(s.id)} className={item}>
-          {s.label}
-        </button>
-      ))}
+      <span className="flex items-center gap-2 border-r border-slate-700 pr-3 text-[11px] font-semibold uppercase tracking-wider text-indigo-300">
+        <svg width="14" height="14" fill="none" viewBox="0 0 24 24" aria-hidden>
+          <path d="M3 12h18M3 6h18M3 18h12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+        </svg>
+        Quick navigation
+      </span>
+      <div className="flex flex-wrap items-center gap-1.5">
+        {sections.map((s) => {
+          const on = active === s.id;
+          return (
+            <button
+              key={s.id}
+              type="button"
+              onClick={() => {
+                setActive(s.id);
+                jumpTo(s.id);
+              }}
+              aria-current={on ? "true" : undefined}
+              className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition-all focus:outline-none focus:ring-2 focus:ring-indigo-500/60 ${
+                on
+                  ? "border-indigo-400/60 bg-indigo-600 text-white shadow-md shadow-indigo-900/50"
+                  : "border-slate-700 bg-slate-800/50 text-slate-300 hover:border-indigo-500/50 hover:bg-indigo-500/15 hover:text-white"
+              }`}
+            >
+              <span aria-hidden>{s.icon}</span>
+              {s.label}
+            </button>
+          );
+        })}
+      </div>
     </nav>
   );
 }
@@ -674,21 +718,21 @@ export default function ReportView({ report, onReset, onStartAnother }: ReportVi
     return cat && cat.round_history.length > 0 ? [{ key, report: cat }] : [];
   });
   const navSections = [
-    ...evaluatedEntries.map((e) => ({ id: e.key, label: CATEGORY_LABELS[e.key] ?? e.key })),
-    ...(evaluatedEntries.length > 0 ? [{ id: "rounds", label: "Rounds" }] : []),
-    { id: "analysis", label: "Analysis" },
+    ...evaluatedEntries.map((e) => ({ id: e.key, label: CATEGORY_LABELS[e.key] ?? e.key, icon: themeFor(e.key).icon })),
+    ...(evaluatedEntries.length > 0 ? [{ id: "rounds", label: "Rounds", icon: "📋" }] : []),
+    { id: "analysis", label: "Analysis", icon: "📈" },
   ];
 
   return (
-    <div className="mx-auto flex w-full max-w-[1450px] flex-col gap-4 print:max-w-none print:gap-3">
+    <div className="mx-auto flex w-full max-w-6xl flex-col gap-5 print:max-w-none print:gap-3">
       {/* Toolbar — screen only, no equivalent on the printed page. Three primary
        * actions; the rarely-used ones live in the ⋯ menu. */}
-      <div className="flex flex-wrap items-center justify-between gap-2 print:hidden">
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-900/50 px-4 py-3 shadow-sm print:hidden">
         {view === "full" ? (
           <button
             type="button"
             onClick={() => showView("summary")}
-            className="rounded-md border border-slate-700 px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-800"
+            className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-700 px-3.5 text-sm font-medium text-slate-300 transition-colors hover:bg-slate-800 hover:text-white"
           >
             ← Back to summary
           </button>
@@ -696,7 +740,7 @@ export default function ReportView({ report, onReset, onStartAnother }: ReportVi
           <button
             type="button"
             onClick={onReset}
-            className="rounded-md border border-slate-700 px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-800"
+            className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-700 px-3.5 text-sm font-medium text-slate-300 transition-colors hover:bg-slate-800 hover:text-white"
           >
             ← Back to sessions
           </button>
@@ -705,19 +749,19 @@ export default function ReportView({ report, onReset, onStartAnother }: ReportVi
         <button
           onClick={() => void handleRejudge()}
           disabled={rejudging}
-          className="rounded-md border border-amber-800 bg-amber-950/30 px-3 py-1.5 text-sm font-medium text-amber-200 hover:bg-amber-900/50 disabled:opacity-50"
+          className="inline-flex h-9 items-center rounded-lg border border-amber-700/70 bg-amber-950/30 px-3.5 text-sm font-medium text-amber-200 transition-colors hover:bg-amber-900/50 disabled:opacity-50"
         >
           {rejudging ? "Re-judging…" : "Re-judge"}
         </button>
         <button
           onClick={handleDownloadJson}
-          className="rounded-md border border-slate-700 px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-800"
+          className="inline-flex h-9 items-center rounded-lg border border-slate-700 px-3.5 text-sm font-medium text-slate-300 transition-colors hover:bg-slate-800 hover:text-white"
         >
           Export JSON
         </button>
         <button
           onClick={handleDownloadPdf}
-          className="rounded-md border border-indigo-700 bg-indigo-950/40 px-3 py-1.5 text-sm font-medium text-indigo-200 hover:bg-indigo-900/50"
+          className="inline-flex h-9 items-center rounded-lg border border-indigo-500/60 bg-indigo-600/30 px-3.5 text-sm font-semibold text-indigo-100 transition-colors hover:bg-indigo-600/50"
         >
           Download PDF
         </button>

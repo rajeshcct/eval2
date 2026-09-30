@@ -44,6 +44,7 @@ from crewai import Agent, Crew, Process, Task
 from agents.schemas import DescriberResult
 from aut.connector import AUTConfig, AUTConnectorError, ManualLookupError, call_aut_with_retry
 from config.llm_config import get_llm
+from config.usage import record_crew_usage
 from progress import OnEvent, emit_event
 
 # ==========================================================================
@@ -320,6 +321,7 @@ def describe_aut(aut_config: AUTConfig, on_event: Optional[OnEvent] = None) -> D
             else:
                 crew_output = crew.kickoff()
 
+            record_crew_usage(crew_output, crew=crew, agent=agent, role="describer")
             result = _extract_pydantic_result(crew_output, describer_task)
             if result is None:
                 raise DescriberError(
@@ -488,6 +490,7 @@ def compare_descriptions(
             else:
                 crew_output = crew.kickoff()
 
+            record_crew_usage(crew_output, crew=crew, agent=agent, role="describer")
             result = _extract_comparison_result(crew_output, comparison_task)
             if result is None:
                 raise DescriberError(
