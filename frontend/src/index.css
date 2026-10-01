@@ -617,9 +617,43 @@ body {
     margin: 16mm 14mm;
   }
 
+  /* The sidebar layout locks the body and every flex container to
+   * overflow:hidden + a fixed viewport height so the page never scrolls.
+   * The browser's print engine respects those constraints and clips the
+   * content to one page — exactly one screen-height page — regardless of
+   * how much content is actually there.
+   * Reset every layer that causes the clip so the report can flow across
+   * as many pages as the content needs. */
   html,
   body {
     background: #ffffff !important;
+    height: auto !important;
+    overflow: visible !important;
+  }
+
+  /* App root (flex h-screen overflow-hidden) */
+  body > div,
+  body > div > div {
+    height: auto !important;
+    overflow: visible !important;
+  }
+
+  /* Sidebar: hide it entirely — the report is the whole page. */
+  nav,
+  aside,
+  [data-sidebar] {
+    display: none !important;
+  }
+
+  /* Main content wrapper (flex flex-1 flex-col overflow-hidden) and the
+   * report's own scroll container (flex-1 overflow-y-auto). */
+  main,
+  main > div,
+  main > div > div {
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+    flex: none !important;
   }
 
   /* Chrome/most browsers drop background colors on print by default

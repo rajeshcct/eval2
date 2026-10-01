@@ -211,7 +211,11 @@ function ScoreTrendChart({ report }: { report: CategoryReport }) {
           ))}
         </div>
       </div>
-      <svg viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`} className="h-28 w-full" preserveAspectRatio="none">
+      {/* Constrain print width so the SVG doesn't stretch to A4 full-bleed.
+           preserveAspectRatio default (xMidYMid meet) keeps proportions intact;
+           "none" was causing all score lines to merge into a single bar in PDF. */}
+      <div className="w-full print:max-w-[520px]">
+      <svg viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`} className="h-28 w-full">
         {[0, 5, 10].map((tick) => (
           <g key={tick}>
             <line
@@ -250,7 +254,7 @@ function ScoreTrendChart({ report }: { report: CategoryReport }) {
 
         {CHART_SERIES.map((s) => {
           const d = pathFor(s.key);
-          return d ? <path key={s.key} d={d} fill="none" stroke={s.color} strokeWidth={1.75} /> : null;
+          return d ? <path key={s.key} d={d} fill="none" stroke={s.color} strokeWidth={2.5} /> : null;
         })}
 
         {CHART_SERIES.map((s) =>
@@ -275,6 +279,7 @@ function ScoreTrendChart({ report }: { report: CategoryReport }) {
           </text>
         ))}
       </svg>
+      </div>
       {breakIndex >= 0 && (
         <div className="mt-1 text-[10px] text-red-400 print:text-red-700">
           Broke at round {report.breaking_point_round}
